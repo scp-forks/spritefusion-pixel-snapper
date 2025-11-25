@@ -50,7 +50,7 @@ impl Default for Config {
             walker_strength_threshold: 0.5,
             min_cuts_per_axis: 4,
             fallback_target_segments: 64,
-            max_step_ratio: 3.0,
+            max_step_ratio: 1.8, // Lowered from 3.0 to catch more skew cases
         }
     }
 }
@@ -109,26 +109,28 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
 
     let quantized_img = quantize_image(&rgb_img, &config)?;
     let (profile_x, profile_y) = compute_profiles(&quantized_img)?;
-    let step_x = estimate_step_size(&profile_x, &config)?;
-    let step_y = estimate_step_size(&profile_y, &config)?;
+
+    // Estimate step sizes
+    let step_x_opt = estimate_step_size(&profile_x, &config);
+    let step_y_opt = estimate_step_size(&profile_y, &config);
+
+    // Resolve step sizes. Some instabilities so use sibling axis if one fails, or fallback if both fail
+    let (step_x, step_y) = resolve_step_sizes(step_x_opt, step_y_opt, width, height, &config);
+
     let raw_col_cuts = walk(&profile_x, step_x, width as usize, &config)?;
     let raw_row_cuts = walk(&profile_y, step_y, height as usize, &config)?;
-    let col_cuts = stabilize_cuts(
+
+    // Two-pass stabilization: first pass with raw cuts, then cross-validate
+    let (col_cuts, row_cuts) = stabilize_both_axes(
         &profile_x,
-        raw_col_cuts,
-        width as usize,
-        &raw_row_cuts,
-        height as usize,
-        &config,
-    );
-    let row_cuts = stabilize_cuts(
         &profile_y,
+        raw_col_cuts,
         raw_row_cuts,
-        height as usize,
-        &col_cuts,
         width as usize,
+        height as usize,
         &config,
     );
+
     let output_img = resample(&quantized_img, &col_cuts, &row_cuts)?;
 
     // Returns bytes for both implementations
@@ -158,7 +160,8 @@ pub fn process_image(
         config.k_colors = k as usize;
     }
 
-    process_image_bytes_common(input_bytes, Some(config)).map_err(|e| wasm_bindgen::JsValue::from(e))
+    process_image_bytes_common(input_bytes, Some(config))
+        .map_err(|e| wasm_bindgen::JsValue::from(e))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -278,10 +281,7 @@ fn quantize_image(img: &RgbImage, config: &Config) -> Result<RgbImage> {
             centroids.push(pixels_f32[idx]);
         } else {
             let dist = WeightedIndex::new(&distances).map_err(|e| {
-                PixelSnapperError::ProcessingError(format!(
-                    "Failed to sample new centroid: {}",
-                    e
-                ))
+                PixelSnapperError::ProcessingError(format!("Failed to sample new centroid: {}", e))
             })?;
             let idx = dist.sample(&mut rng);
             centroids.push(pixels_f32[idx]);
@@ -393,16 +393,14 @@ fn compute_profiles(img: &RgbImage) -> Result<(Vec<f64>, Vec<f64>)> {
     Ok((col_proj, row_proj))
 }
 
-fn estimate_step_size(profile: &[f64], config: &Config) -> Result<f64> {
+fn estimate_step_size(profile: &[f64], config: &Config) -> Option<f64> {
     if profile.is_empty() {
-        return Err(PixelSnapperError::ProcessingError(
-            "Cannot estimate step size from empty profile".to_string(),
-        ));
+        return None;
     }
 
     let max_val = profile.iter().cloned().fold(0.0 / 0.0, f64::max);
     if max_val == 0.0 {
-        return Ok(10.0); // flat image
+        return None; // Decide later
     }
     let threshold = max_val * config.peak_threshold_multiplier;
 
@@ -414,7 +412,7 @@ fn estimate_step_size(profile: &[f64], config: &Config) -> Result<f64> {
     }
 
     if peaks.len() < 2 {
-        return Ok(10.0);
+        return None;
     }
 
     let mut clean_peaks = vec![peaks[0]];
@@ -425,7 +423,7 @@ fn estimate_step_size(profile: &[f64], config: &Config) -> Result<f64> {
     }
 
     if clean_peaks.len() < 2 {
-        return Ok(10.0);
+        return None;
     }
 
     // Compute diffs
@@ -436,9 +434,113 @@ fn estimate_step_size(profile: &[f64], config: &Config) -> Result<f64> {
 
     // Median
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    Ok(diffs[diffs.len() / 2])
+    Some(diffs[diffs.len() / 2])
 }
 
+fn resolve_step_sizes(
+    step_x_opt: Option<f64>,
+    step_y_opt: Option<f64>,
+    width: u32,
+    height: u32,
+    config: &Config,
+) -> (f64, f64) {
+    match (step_x_opt, step_y_opt) {
+        (Some(sx), Some(sy)) => {
+            let ratio = if sx > sy { sx / sy } else { sy / sx };
+            if ratio > config.max_step_ratio {
+                let smaller = sx.min(sy);
+                (smaller, smaller)
+            } else {
+                let avg = (sx + sy) / 2.0;
+                (avg, avg)
+            }
+        }
+
+        (Some(sx), None) => (sx, sx),
+
+        (None, Some(sy)) => (sy, sy),
+
+        (None, None) => {
+            let fallback_step =
+                ((width.min(height) as f64) / config.fallback_target_segments as f64).max(1.0);
+            (fallback_step, fallback_step)
+        }
+    }
+}
+
+fn stabilize_both_axes(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    raw_col_cuts: Vec<usize>,
+    raw_row_cuts: Vec<usize>,
+    width: usize,
+    height: usize,
+    config: &Config,
+) -> (Vec<usize>, Vec<usize>) {
+    let col_cuts_pass1 = stabilize_cuts(
+        profile_x,
+        raw_col_cuts.clone(),
+        width,
+        &raw_row_cuts,
+        height,
+        config,
+    );
+    let row_cuts_pass1 = stabilize_cuts(
+        profile_y,
+        raw_row_cuts.clone(),
+        height,
+        &raw_col_cuts,
+        width,
+        config,
+    );
+
+    // Check if the results are coherent
+    let col_cells = col_cuts_pass1.len().saturating_sub(1).max(1);
+    let row_cells = row_cuts_pass1.len().saturating_sub(1).max(1);
+    let col_step = width as f64 / col_cells as f64;
+    let row_step = height as f64 / row_cells as f64;
+
+    let step_ratio = if col_step > row_step {
+        col_step / row_step
+    } else {
+        row_step / col_step
+    };
+
+    if step_ratio > config.max_step_ratio {
+        let target_step = col_step.min(row_step);
+
+        let final_col_cuts = if col_step > target_step * 1.2 {
+            snap_uniform_cuts(
+                profile_x,
+                width,
+                target_step,
+                config,
+                config.min_cuts_per_axis,
+            )
+        } else {
+            col_cuts_pass1
+        };
+
+        let final_row_cuts = if row_step > target_step * 1.2 {
+            snap_uniform_cuts(
+                profile_y,
+                height,
+                target_step,
+                config,
+                config.min_cuts_per_axis,
+            )
+        } else {
+            row_cuts_pass1
+        };
+
+        (final_col_cuts, final_row_cuts)
+    } else {
+        (col_cuts_pass1, row_cuts_pass1)
+    }
+}
+
+// Tried uniform grid instead of an elastic-ish walker, but the result was a bit worse.
+// Keeping the walker for now. But some distortions might happen...
 fn walk(profile: &[f64], step_size: f64, limit: usize, config: &Config) -> Result<Vec<usize>> {
     if profile.is_empty() {
         return Err(PixelSnapperError::ProcessingError(
@@ -500,21 +602,17 @@ fn stabilize_cuts(
     }
 
     let cuts = sanitize_cuts(cuts, limit);
-    let min_required = config
-        .min_cuts_per_axis
-        .max(2)
-        .min(limit.saturating_add(1));
+    let min_required = config.min_cuts_per_axis.max(2).min(limit.saturating_add(1));
     let axis_cells = cuts.len().saturating_sub(1);
     let sibling_cells = sibling_cuts.len().saturating_sub(1);
     let sibling_has_grid =
         sibling_limit > 0 && sibling_cells >= min_required.saturating_sub(1) && sibling_cells > 0;
-    let steps_skewed = sibling_has_grid
-        && axis_cells > 0
-        && {
-            let axis_step = limit as f64 / axis_cells as f64;
-            let sibling_step = sibling_limit as f64 / sibling_cells as f64;
-            axis_step > sibling_step * config.max_step_ratio
-        };
+    let steps_skewed = sibling_has_grid && axis_cells > 0 && {
+        let axis_step = limit as f64 / axis_cells as f64;
+        let sibling_step = sibling_limit as f64 / sibling_cells as f64;
+        let step_ratio = axis_step / sibling_step;
+        step_ratio > config.max_step_ratio || step_ratio < 1.0 / config.max_step_ratio
+    };
     let has_enough = cuts.len() >= min_required;
 
     if has_enough && !steps_skewed {
@@ -611,10 +709,10 @@ fn snap_uniform_cuts(
         if prev + 1 >= limit {
             break;
         }
-        let mut start =
-            ((target - search_window).floor() as isize).max(prev as isize + 1).max(0);
-        let mut end =
-            ((target + search_window).ceil() as isize).min(limit as isize - 1);
+        let mut start = ((target - search_window).floor() as isize)
+            .max(prev as isize + 1)
+            .max(0);
+        let mut end = ((target + search_window).ceil() as isize).min(limit as isize - 1);
         if end < start {
             start = prev as isize + 1;
             end = start;
