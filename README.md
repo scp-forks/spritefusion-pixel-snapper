@@ -32,11 +32,45 @@ A tool to snap pixels to a perfect grid. Designed to fix messy and inconsistent 
 
 <br>
 
-## Pixel Snapper comes in two flavors
+## How it works
 
-Requires [Rust](https://www.rust-lang.org/) installed on your machine.
+Pixel Snapper analyzes the input image to detect the underlying pixel grid, then resamples and quantizes accordingly:
+
+1. **Color quantization** — K-means clustering reduces the image to a strict palette of `k` colors (default 16, configurable from 2–64).
+2. **Grid detection** — Gradient profiles are computed along both axes to find repeating grid boundaries. An adaptive walker algorithm locates the exact cut positions.
+3. **Resampling** — Each detected grid cell is collapsed into a single output pixel via majority voting, producing a clean image at the **native pixel art resolution**.
+
+### Output resolution
+
+The output image will be **smaller than the input**. This is by design. For example, a 1024×1024 image with an underlying ~5px grid will produce roughly a 200×200 output — the true pixel art resolution with one pixel per grid cell. To display it at the original size, scale it up with nearest-neighbor interpolation (`image-rendering: pixelated` in CSS).
+
+<br>
+
+## Pixel Snapper comes in three flavors
+
+### 🎨 Web UI (frontend)
+
+The easiest way to use Pixel Snapper. Requires [Rust](https://www.rust-lang.org/) and [Node.js](https://nodejs.org/).
+
+```bash
+git clone https://github.com/Hugo-Dz/spritefusion-pixel-snapper.git
+cd spritefusion-pixel-snapper
+```
+
+Build the WASM module and start the frontend:
+
+```bash
+wasm-pack build --target web --out-dir pkg --release
+cd spritefusion-frontend
+npm install
+npm run dev
+```
+
+Then open the URL shown in your terminal. Drag and drop an image, adjust the color count, and compare before/after with the interactive slider.
 
 ### 💻 CLI
+
+Requires [Rust](https://www.rust-lang.org/) installed on your machine.
 
 ```bash
 git clone https://github.com/Hugo-Dz/spritefusion-pixel-snapper.git
@@ -53,20 +87,25 @@ The command accepts an optional k-colors argument:
 cargo run input.png output.png 16
 ```
 
-### 🌐 Web (WASM)
+### 🌐 WASM (library)
 
-```bash
-git clone https://github.com/Hugo-Dz/spritefusion-pixel-snapper.git
-cd spritefusion-pixel-snapper
-```
-
-Build the WASM module:
+For integrating Pixel Snapper into your own web project.
 
 ```bash
 wasm-pack build --target web --out-dir pkg --release
 ```
 
-Then use the WASM module in your project.
+Then import and use the WASM module:
+
+```js
+import init, { process_image } from './pkg/spritefusion_pixel_snapper.js';
+
+await init();
+const inputBytes = new Uint8Array(/* PNG or JPEG bytes */);
+const outputPng = process_image(inputBytes, 16); // 16 colors
+```
+
+The `process_image` function takes raw image bytes (PNG/JPEG) and an optional color count, and returns PNG bytes of the processed image.
 
 ## Acknowledgments
 

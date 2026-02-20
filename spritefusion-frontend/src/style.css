@@ -312,29 +312,12 @@ body {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 
-.comparison-handle::before,
-.comparison-handle::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  width: 6px;
-  height: 2px;
-  background: #fff;
-  border-radius: 1px;
-}
-
-.comparison-handle::before {
-  left: 4px;
-  transform: translateY(-50%);
-}
-
-.comparison-handle::after {
-  right: 4px;
-  transform: translateY(-50%);
-}
-
 .comparison-divider-active .comparison-handle {
   transform: translate(-50%, -50%) scale(1.1);
+}
+
+.comparison-wrapper {
+  cursor: ew-resize;
 }
 
 .comparison-label {

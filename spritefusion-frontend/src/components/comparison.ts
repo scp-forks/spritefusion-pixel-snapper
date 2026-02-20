@@ -29,26 +29,31 @@ export function createComparison(container: HTMLElement) {
 
   function onPointerDown(e: PointerEvent) {
     e.preventDefault();
-    divider.setPointerCapture(e.pointerId);
+    wrapper.setPointerCapture(e.pointerId);
     divider.classList.add('comparison-divider-active');
 
+    // Jump to click position immediately
+    const rect = wrapper.getBoundingClientRect();
+    pct = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+    updatePosition();
+
     const onMove = (ev: PointerEvent) => {
-      const rect = wrapper.getBoundingClientRect();
-      pct = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
+      const r = wrapper.getBoundingClientRect();
+      pct = Math.max(0, Math.min(100, ((ev.clientX - r.left) / r.width) * 100));
       updatePosition();
     };
 
     const onUp = () => {
       divider.classList.remove('comparison-divider-active');
-      divider.removeEventListener('pointermove', onMove);
-      divider.removeEventListener('pointerup', onUp);
+      wrapper.removeEventListener('pointermove', onMove);
+      wrapper.removeEventListener('pointerup', onUp);
     };
 
-    divider.addEventListener('pointermove', onMove);
-    divider.addEventListener('pointerup', onUp);
+    wrapper.addEventListener('pointermove', onMove);
+    wrapper.addEventListener('pointerup', onUp);
   }
 
-  divider.addEventListener('pointerdown', onPointerDown);
+  wrapper.addEventListener('pointerdown', onPointerDown);
 
   const resizeObserver = new ResizeObserver(() => updatePosition());
   resizeObserver.observe(wrapper);
