@@ -10,6 +10,7 @@ export function createComparison(container: HTMLElement) {
       </div>
       <span class="comparison-label comparison-label-left">Original</span>
       <span class="comparison-label comparison-label-right">Processed</span>
+      <button class="comparison-size-toggle" type="button" title="Toggle view size">Fit</button>
     </div>
   `;
 
@@ -18,8 +19,10 @@ export function createComparison(container: HTMLElement) {
   const processedImg = container.querySelector<HTMLImageElement>('.comparison-processed')!;
   const clipDiv = container.querySelector<HTMLDivElement>('.comparison-clip')!;
   const divider = container.querySelector<HTMLDivElement>('.comparison-divider')!;
+  const toggleBtn = container.querySelector<HTMLButtonElement>('.comparison-size-toggle')!;
 
   let pct = 50;
+  let nativeMode = false;
 
   function updatePosition() {
     divider.style.left = `${pct}%`;
@@ -27,7 +30,34 @@ export function createComparison(container: HTMLElement) {
     processedImg.style.width = `${wrapper.offsetWidth}px`;
   }
 
+  function applyMode() {
+    if (nativeMode) {
+      // Size wrapper to the processed image's native dimensions
+      const w = processedImg.naturalWidth;
+      const h = processedImg.naturalHeight;
+      if (w && h) {
+        wrapper.style.maxWidth = `${w}px`;
+        wrapper.style.aspectRatio = `${w} / ${h}`;
+      }
+      toggleBtn.textContent = '1:1';
+    } else {
+      wrapper.style.maxWidth = '';
+      wrapper.style.aspectRatio = '';
+      toggleBtn.textContent = 'Fit';
+    }
+    updatePosition();
+  }
+
+  toggleBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    nativeMode = !nativeMode;
+    applyMode();
+  });
+
   function onPointerDown(e: PointerEvent) {
+    // Don't start drag if clicking the toggle button
+    if ((e.target as HTMLElement).closest('.comparison-size-toggle')) return;
+
     e.preventDefault();
     wrapper.setPointerCapture(e.pointerId);
     divider.classList.add('comparison-divider-active');
@@ -62,10 +92,14 @@ export function createComparison(container: HTMLElement) {
     setImages(originalUrl: string, processedUrl: string) {
       originalImg.src = originalUrl;
       processedImg.src = processedUrl;
+      // Reset to fit mode on new image
+      nativeMode = false;
+      applyMode();
       originalImg.onload = () => updatePosition();
     },
     updateProcessed(processedUrl: string) {
       processedImg.src = processedUrl;
+      processedImg.onload = () => applyMode();
     },
   };
 }
