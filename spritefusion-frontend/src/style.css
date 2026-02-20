@@ -250,6 +250,8 @@ body {
   user-select: none;
   touch-action: none;
   transition: max-width 0.3s ease;
+  container-name: comparison-container;
+  container-type: inline-size;
 }
 
 .comparison-original,
@@ -332,6 +334,13 @@ body {
   border-radius: 4px;
   pointer-events: none;
   z-index: 3;
+  transition: opacity 0.2s;
+}
+
+@container comparison-container (max-width: 400px) {
+  .comparison-label {
+    opacity: 0;
+  }
 }
 
 .comparison-label-left {
