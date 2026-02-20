@@ -6,7 +6,7 @@ import {
   getOutputFilename,
   revokeObjectUrl,
 } from './utils/image-helpers';
-import { createDropzone } from './components/dropzone';
+import { createDropzone, validateFile } from './components/dropzone';
 import { createControls } from './components/controls';
 import { createComparison } from './components/comparison';
 import { createToolbar } from './components/toolbar';
@@ -121,6 +121,20 @@ async function runProcess() {
     controls.setProcessing(false);
   }
 }
+
+// --- Global drop handler (drop anywhere on the page) ---
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer?.files[0];
+  if (!file) return;
+  const err = validateFile(file);
+  if (err) {
+    showToast(err);
+    return;
+  }
+  handleFile(file);
+});
 
 // --- Init WASM eagerly ---
 initWasm().catch((err) => {

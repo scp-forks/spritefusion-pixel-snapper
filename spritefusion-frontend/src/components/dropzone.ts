@@ -1,5 +1,11 @@
-const ACCEPTED_TYPES = ['image/png', 'image/jpeg'];
-const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+export const ACCEPTED_TYPES = ['image/png', 'image/jpeg'];
+export const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+
+export function validateFile(file: File): string | null {
+  if (!ACCEPTED_TYPES.includes(file.type)) return 'Only PNG and JPEG files are supported.';
+  if (file.size > MAX_SIZE) return 'File must be under 10 MB.';
+  return null;
+}
 
 export interface DropzoneCallbacks {
   onFile: (file: File) => void;
@@ -35,14 +41,8 @@ export function createDropzone(
   container.appendChild(label);
   container.appendChild(changeStrip);
 
-  function validate(file: File): string | null {
-    if (!ACCEPTED_TYPES.includes(file.type)) return 'Only PNG and JPEG files are supported.';
-    if (file.size > MAX_SIZE) return 'File must be under 10 MB.';
-    return null;
-  }
-
   function handleFile(file: File) {
-    const err = validate(file);
+    const err = validateFile(file);
     if (err) {
       container.classList.add('dropzone-error');
       label.querySelector('.dropzone-text')!.textContent = err;
