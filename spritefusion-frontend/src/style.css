@@ -291,6 +291,8 @@ body {
   cursor: ew-resize;
   transform: translateX(-50%);
   z-index: 2;
+  opacity: 0;
+  transition: opacity 0.2s;
 }
 
 .comparison-divider::before {
@@ -319,6 +321,15 @@ body {
   transform: translate(-50%, -50%) scale(1.1);
 }
 
+/* Show overlays on hover or during active drag */
+.comparison-wrapper:hover .comparison-divider,
+.comparison-wrapper:hover .comparison-label,
+.comparison-wrapper:hover .comparison-size-toggle,
+.comparison-divider-active,
+.comparison-divider-active ~ .comparison-label {
+  opacity: 1;
+}
+
 .comparison-wrapper {
   cursor: ew-resize;
 }
@@ -334,6 +345,7 @@ body {
   border-radius: 4px;
   pointer-events: none;
   z-index: 3;
+  opacity: 0;
   transition: opacity 0.2s;
 }
 
@@ -366,7 +378,8 @@ body {
   border-radius: 4px;
   cursor: pointer;
   pointer-events: auto;
-  transition: background 0.15s, border-color 0.15s;
+  opacity: 0;
+  transition: opacity 0.2s, background 0.15s, border-color 0.15s;
 }
 
 .comparison-size-toggle:hover {
