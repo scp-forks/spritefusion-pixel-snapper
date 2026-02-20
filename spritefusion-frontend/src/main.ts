@@ -181,6 +181,26 @@ document.addEventListener('drop', (e) => {
   handleFile(file);
 });
 
+// --- Paste handler (Ctrl-V / Cmd-V) ---
+document.addEventListener('paste', (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (!file) return;
+      const err = validateFile(file);
+      if (err) {
+        showToast(err);
+        return;
+      }
+      handleFile(file);
+      return;
+    }
+  }
+});
+
 // --- Init WASM eagerly ---
 initWasm().catch((err) => {
   showToast(`Failed to load WASM: ${err}`);
