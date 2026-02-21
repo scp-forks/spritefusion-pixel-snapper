@@ -258,11 +258,10 @@ body {
 .comparison-processed {
   display: block;
   width: 100%;
-  image-rendering: pixelated;
 }
 
-.comparison-original {
-  display: block;
+.comparison-processed {
+  image-rendering: pixelated;
 }
 
 .comparison-clip {
