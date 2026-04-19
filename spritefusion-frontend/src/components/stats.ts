@@ -10,7 +10,14 @@ export interface StatsData {
   algorithm: number;
 }
 
-const ALGORITHM_NAMES = ['K-Means (Perceptual)', 'Median Cut', "Wu's Optimal"];
+const ALGORITHM_NAMES = [
+  'K-Means (Perceptual)',
+  'Median Cut',
+  "Wu's Optimal",
+  'Spatial (Pixel Art)',
+  'Grey Wolf Optimization',
+  'Differentiable Palette',
+];
 
 function formatNumber(n: number): string {
   return n.toLocaleString();

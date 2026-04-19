@@ -25,6 +25,9 @@ export function createControls(
         <option value="0">K-Means (Perceptual)</option>
         <option value="1">Median Cut</option>
         <option value="2">Wu's Optimal</option>
+        <option value="3">Spatial (Pixel Art)</option>
+        <option value="4">Grey Wolf Optimization</option>
+        <option value="5">Differentiable Palette</option>
       </select>
     </div>
     <button class="controls-btn" type="button">
