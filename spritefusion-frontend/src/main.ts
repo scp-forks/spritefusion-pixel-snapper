@@ -142,9 +142,10 @@ async function runProcess() {
     }
 
     // Compute and show stats
-    const [origDim, outDim] = await Promise.all([
+    const [origDim, outDim, outputUniqueColors] = await Promise.all([
       getImageDimensions(state.originalUrl!),
       getImageDimensions(state.processedUrl),
+      countUniqueColors(state.processedUrl),
     ]);
     stats.update({
       originalWidth: origDim.width,
@@ -153,6 +154,7 @@ async function runProcess() {
       outputWidth: outDim.width,
       outputHeight: outDim.height,
       kColors: state.kColors,
+      outputUniqueColors,
       noResize: state.noResize,
       algorithm: state.algorithm,
     });

@@ -5,6 +5,7 @@ export interface StatsData {
   outputWidth: number;
   outputHeight: number;
   kColors: number;
+  outputUniqueColors: number;
   noResize: boolean;
   algorithm: number;
 }
@@ -70,8 +71,8 @@ export function createStats(container: HTMLElement) {
             <span class="stat-label">Resolution</span>
           </div>
           <div class="stat">
-            <span class="stat-value">${data.kColors}</span>
-            <span class="stat-label">Palette colors</span>
+            <span class="stat-value">${formatNumber(data.outputUniqueColors)}</span>
+            <span class="stat-label">Unique colors</span>
           </div>
         </div>
         <div class="stat-divider"></div>

@@ -21,12 +21,13 @@ pub enum QuantAlgorithm {
     Wu = 2,
 }
 
-impl From<u32> for QuantAlgorithm {
-    fn from(v: u32) -> Self {
+impl QuantAlgorithm {
+    fn try_from_u32(v: u32) -> std::result::Result<Self, String> {
         match v {
-            1 => QuantAlgorithm::MedianCut,
-            2 => QuantAlgorithm::Wu,
-            _ => QuantAlgorithm::KMeansPerceptual,
+            0 => Ok(QuantAlgorithm::KMeansPerceptual),
+            1 => Ok(QuantAlgorithm::MedianCut),
+            2 => Ok(QuantAlgorithm::Wu),
+            _ => Err(format!("Invalid algorithm ID: {}. Valid values: 0 (K-Means Perceptual), 1 (Median Cut), 2 (Wu's Optimal)", v)),
         }
     }
 }
@@ -276,7 +277,8 @@ pub fn process_image_advanced(
         config.no_resize = nr;
     }
     if let Some(alg) = algorithm {
-        config.algorithm = QuantAlgorithm::from(alg);
+        config.algorithm = QuantAlgorithm::try_from_u32(alg)
+            .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
     }
 
     process_image_bytes_common(input_bytes, Some(config))
@@ -304,6 +306,24 @@ fn parse_args() -> Option<Config> {
                 "Warning: invalid k_colors '{}', falling back to default ({})",
                 k_arg, config.k_colors
             ),
+        }
+    }
+
+    // Optional flags: --no-resize, --algorithm=<0|1|2>
+    for arg in args.iter().skip(3) {
+        if arg == "--no-resize" {
+            config.no_resize = true;
+        } else if let Some(alg_str) = arg.strip_prefix("--algorithm=") {
+            match alg_str.parse::<u32>() {
+                Ok(v) => match QuantAlgorithm::try_from_u32(v) {
+                    Ok(alg) => config.algorithm = alg,
+                    Err(e) => eprintln!("Warning: {}", e),
+                },
+                Err(_) => eprintln!(
+                    "Warning: invalid algorithm '{}', using default",
+                    alg_str
+                ),
+            }
         }
     }
 
@@ -658,7 +678,7 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
     }
 
     impl ColorBox {
-        fn longest_axis(&self) -> usize {
+        fn ranges(&self) -> (u8, u8, u8) {
             let (mut min_r, mut min_g, mut min_b) = (255u8, 255u8, 255u8);
             let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
             for p in &self.pixels {
@@ -669,9 +689,11 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
                 max_g = max_g.max(p[1]);
                 max_b = max_b.max(p[2]);
             }
-            let range_r = max_r - min_r;
-            let range_g = max_g - min_g;
-            let range_b = max_b - min_b;
+            (max_r - min_r, max_g - min_g, max_b - min_b)
+        }
+
+        fn longest_axis(&self) -> usize {
+            let (range_r, range_g, range_b) = self.ranges();
             if range_r >= range_g && range_r >= range_b {
                 0
             } else if range_g >= range_b {
@@ -681,9 +703,34 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
             }
         }
 
-        fn average_color(&self) -> [u8; 3] {
+        /// Variance-weighted priority: actual color variance * pixel count.
+        /// Higher variance boxes should be split first for better quality.
+        fn variance_score(&self) -> f64 {
+            if self.pixels.len() <= 1 {
+                return 0.0;
+            }
+            let n = self.pixels.len() as f64;
+            let (mut sr, mut sg, mut sb) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut sr2, mut sg2, mut sb2) = (0.0f64, 0.0f64, 0.0f64);
+            for p in &self.pixels {
+                let (r, g, b) = (p[0] as f64, p[1] as f64, p[2] as f64);
+                sr += r;
+                sg += g;
+                sb += b;
+                sr2 += r * r;
+                sg2 += g * g;
+                sb2 += b * b;
+            }
+            let var_r = sr2 / n - (sr / n).powi(2);
+            let var_g = sg2 / n - (sg / n).powi(2);
+            let var_b = sb2 / n - (sb / n).powi(2);
+            // Total variance weighted by population
+            (var_r + var_g + var_b) * n
+        }
+
+        fn average_color(&self) -> [f32; 3] {
             if self.pixels.is_empty() {
-                return [0, 0, 0];
+                return [0.0, 0.0, 0.0];
             }
             let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
             for p in &self.pixels {
@@ -691,8 +738,8 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
                 sg += p[1] as u64;
                 sb += p[2] as u64;
             }
-            let n = self.pixels.len() as u64;
-            [(sr / n) as u8, (sg / n) as u8, (sb / n) as u8]
+            let n = self.pixels.len() as f32;
+            [sr as f32 / n, sg as f32 / n, sb as f32 / n]
         }
 
         fn split(mut self) -> (ColorBox, ColorBox) {
@@ -704,19 +751,29 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
         }
     }
 
+    fn dist_sq_f32(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+        let dr = a[0] - b[0];
+        let dg = a[1] - b[1];
+        let db = a[2] - b[2];
+        dr * dr + dg * dg + db * db
+    }
+
     let k = k_colors.min(opaque_pixels.len());
     let mut boxes = vec![ColorBox {
         pixels: opaque_pixels,
     }];
 
-    // Split boxes until we have k boxes (or can't split further)
+    // Split boxes by highest variance until we have k boxes
     while boxes.len() < k {
-        // Find the box with the largest volume (most pixels) that can be split
         let split_idx = boxes
             .iter()
             .enumerate()
             .filter(|(_, b)| b.pixels.len() > 1)
-            .max_by_key(|(_, b)| b.pixels.len())
+            .max_by(|(_, a), (_, b)| {
+                a.variance_score()
+                    .partial_cmp(&b.variance_score())
+                    .unwrap_or(Ordering::Equal)
+            })
             .map(|(i, _)| i);
 
         match split_idx {
@@ -726,19 +783,66 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
                 boxes.push(left);
                 boxes.push(right);
             }
-            None => break, // All boxes have 1 pixel, can't split further
+            None => break,
         }
     }
 
-    // Build palette from box averages
-    let palette: Vec<[u8; 3]> = boxes.iter().map(|b| b.average_color()).collect();
+    // Initial palette from box averages
+    let mut palette: Vec<[f32; 3]> = boxes.iter().map(|b| b.average_color()).collect();
 
-    fn dist_sq_u8(a: &[u8; 3], b: &[u8; 3]) -> u32 {
-        let dr = a[0] as i32 - b[0] as i32;
-        let dg = a[1] as i32 - b[1] as i32;
-        let db = a[2] as i32 - b[2] as i32;
-        (dr * dr + dg * dg + db * db) as u32
+    // Collect all opaque pixels as f32 for refinement
+    let all_pixels: Vec<[f32; 3]> = img
+        .pixels()
+        .filter_map(|p| {
+            if p[3] == 0 {
+                None
+            } else {
+                Some([p[0] as f32, p[1] as f32, p[2] as f32])
+            }
+        })
+        .collect();
+
+    // K-means refinement pass (3 iterations to polish the median-cut palette)
+    for _ in 0..3 {
+        let pk = palette.len();
+        let mut sums = vec![[0.0f32; 3]; pk];
+        let mut counts = vec![0usize; pk];
+
+        for p in &all_pixels {
+            let mut min_dist = f32::MAX;
+            let mut best = 0;
+            for (i, c) in palette.iter().enumerate() {
+                let d = dist_sq_f32(p, c);
+                if d < min_dist {
+                    min_dist = d;
+                    best = i;
+                }
+            }
+            sums[best][0] += p[0];
+            sums[best][1] += p[1];
+            sums[best][2] += p[2];
+            counts[best] += 1;
+        }
+
+        for i in 0..pk {
+            if counts[i] > 0 {
+                let n = counts[i] as f32;
+                palette[i] = [sums[i][0] / n, sums[i][1] / n, sums[i][2] / n];
+            }
+        }
     }
+
+    // Convert palette to u8
+    let palette_u8: Vec<[u8; 3]> = palette
+        .iter()
+        .map(|c| {
+            [
+                c[0].round().clamp(0.0, 255.0) as u8,
+                c[1].round().clamp(0.0, 255.0) as u8,
+                c[2].round().clamp(0.0, 255.0) as u8,
+            ]
+        })
+        .collect();
 
     // Remap pixels to nearest palette entry
     let mut new_img = RgbaImage::new(img.width(), img.height());
@@ -747,17 +851,18 @@ fn median_cut_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
             new_img.put_pixel(x, y, *pixel);
             continue;
         }
-        let p = [pixel[0], pixel[1], pixel[2]];
-        let mut min_dist = u32::MAX;
-        let mut best_c = p;
-        for c in &palette {
-            let d = dist_sq_u8(&p, c);
+        let p = [pixel[0] as f32, pixel[1] as f32, pixel[2] as f32];
+        let mut min_dist = f32::MAX;
+        let mut best_idx = 0;
+        for (i, c) in palette.iter().enumerate() {
+            let d = dist_sq_f32(&p, c);
             if d < min_dist {
                 min_dist = d;
-                best_c = *c;
+                best_idx = i;
             }
         }
-        new_img.put_pixel(x, y, Rgba([best_c[0], best_c[1], best_c[2], pixel[3]]));
+        let c = palette_u8[best_idx];
+        new_img.put_pixel(x, y, Rgba([c[0], c[1], c[2], pixel[3]]));
     }
     Ok(new_img)
 }
@@ -771,7 +876,7 @@ fn wu_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
         ));
     }
 
-    const HIST_SIZE: usize = 33; // indices 0..32, where bin = channel/8 + 1
+    const HIST_SIZE: usize = 65; // indices 0..64, where bin = channel/4 + 1
     const TOTAL: usize = HIST_SIZE * HIST_SIZE * HIST_SIZE;
 
     fn idx(r: usize, g: usize, b: usize) -> usize {
@@ -789,9 +894,9 @@ fn wu_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
         if pixel[3] == 0 {
             continue;
         }
-        let ri = (pixel[0] as usize >> 3) + 1;
-        let gi = (pixel[1] as usize >> 3) + 1;
-        let bi = (pixel[2] as usize >> 3) + 1;
+        let ri = (pixel[0] as usize >> 2) + 1;
+        let gi = (pixel[1] as usize >> 2) + 1;
+        let bi = (pixel[2] as usize >> 2) + 1;
         let i = idx(ri, gi, bi);
         wt[i] += 1;
         mr[i] += pixel[0] as i64;
@@ -1071,9 +1176,9 @@ fn wu_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
     for ri in 1..HIST_SIZE {
         for gi in 1..HIST_SIZE {
             for bi in 1..HIST_SIZE {
-                let bin_r = ((ri as u32 - 1) * 8 + 4) as u8; // bin center
-                let bin_g = ((gi as u32 - 1) * 8 + 4) as u8;
-                let bin_b = ((bi as u32 - 1) * 8 + 4) as u8;
+                let bin_r = ((ri as u32 - 1) * 4 + 2) as u8; // bin center
+                let bin_g = ((gi as u32 - 1) * 4 + 2) as u8;
+                let bin_b = ((bi as u32 - 1) * 4 + 2) as u8;
                 let mut min_dist = u32::MAX;
                 let mut best = 0u8;
                 for (pi, pc) in palette.iter().enumerate() {
@@ -1098,9 +1203,9 @@ fn wu_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
             new_img.put_pixel(x, y, *pixel);
             continue;
         }
-        let ri = (pixel[0] as usize >> 3) + 1;
-        let gi = (pixel[1] as usize >> 3) + 1;
-        let bi = (pixel[2] as usize >> 3) + 1;
+        let ri = (pixel[0] as usize >> 2) + 1;
+        let gi = (pixel[1] as usize >> 2) + 1;
+        let bi = (pixel[2] as usize >> 2) + 1;
         let c = palette[lut[idx(ri, gi, bi)] as usize];
         new_img.put_pixel(x, y, Rgba([c[0], c[1], c[2], pixel[3]]));
     }
@@ -1557,4 +1662,262 @@ fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage
         }
     }
     Ok(final_img)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a small test image with known colors
+    fn make_test_image(w: u32, h: u32, colors: &[[u8; 4]]) -> RgbaImage {
+        let mut img = RgbaImage::new(w, h);
+        for (i, (_x, _y, pixel)) in img.enumerate_pixels_mut().enumerate() {
+            *pixel = Rgba(colors[i % colors.len()]);
+        }
+        img
+    }
+
+    /// Count unique opaque colors in an image
+    fn count_unique_colors(img: &RgbaImage) -> usize {
+        let mut colors = std::collections::HashSet::new();
+        for pixel in img.pixels() {
+            if pixel[3] > 0 {
+                colors.insert([pixel[0], pixel[1], pixel[2]]);
+            }
+        }
+        colors.len()
+    }
+
+    /// Encode an image as PNG bytes (simulates the input path)
+    fn img_to_png_bytes(img: &RgbaImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut bytes);
+        img.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+        bytes
+    }
+
+    // --- Dimension preservation ---
+
+    #[test]
+    fn oklab_preserves_dimensions() {
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [128, 128, 0, 255],
+        ]);
+        let config = Config { k_colors: 2, ..Default::default() };
+        let result = quantize_image_oklab(&img, &config).unwrap();
+        assert_eq!((result.width(), result.height()), (10, 10));
+    }
+
+    #[test]
+    fn median_cut_preserves_dimensions() {
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [128, 128, 0, 255],
+        ]);
+        let result = median_cut_quantize(&img, 2).unwrap();
+        assert_eq!((result.width(), result.height()), (10, 10));
+    }
+
+    #[test]
+    fn wu_preserves_dimensions() {
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [128, 128, 0, 255],
+        ]);
+        let result = wu_quantize(&img, 2).unwrap();
+        assert_eq!((result.width(), result.height()), (10, 10));
+    }
+
+    // --- Alpha preservation ---
+
+    #[test]
+    fn oklab_preserves_transparency() {
+        let img = make_test_image(4, 4, &[
+            [255, 0, 0, 255], [0, 255, 0, 0], // one opaque, one transparent
+        ]);
+        let config = Config { k_colors: 2, ..Default::default() };
+        let result = quantize_image_oklab(&img, &config).unwrap();
+        // Transparent pixels remain transparent
+        assert_eq!(result.get_pixel(1, 0)[3], 0);
+        assert_eq!(result.get_pixel(3, 0)[3], 0);
+        // Opaque pixels remain opaque
+        assert_eq!(result.get_pixel(0, 0)[3], 255);
+    }
+
+    #[test]
+    fn median_cut_preserves_transparency() {
+        let img = make_test_image(4, 4, &[
+            [255, 0, 0, 255], [0, 255, 0, 0],
+        ]);
+        let result = median_cut_quantize(&img, 2).unwrap();
+        assert_eq!(result.get_pixel(1, 0)[3], 0);
+        assert_eq!(result.get_pixel(0, 0)[3], 255);
+    }
+
+    #[test]
+    fn wu_preserves_transparency() {
+        let img = make_test_image(4, 4, &[
+            [255, 0, 0, 255], [0, 255, 0, 0],
+        ]);
+        let result = wu_quantize(&img, 2).unwrap();
+        assert_eq!(result.get_pixel(1, 0)[3], 0);
+        assert_eq!(result.get_pixel(0, 0)[3], 255);
+    }
+
+    // --- Output colors <= k ---
+
+    #[test]
+    fn oklab_respects_k_limit() {
+        let img = make_test_image(20, 20, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+            [255, 255, 0, 255], [128, 0, 128, 255], [0, 128, 128, 255],
+        ]);
+        for k in [2, 4, 6] {
+            let config = Config { k_colors: k, ..Default::default() };
+            let result = quantize_image_oklab(&img, &config).unwrap();
+            let unique = count_unique_colors(&result);
+            assert!(unique <= k, "OKLab k={}: got {} unique colors", k, unique);
+        }
+    }
+
+    #[test]
+    fn median_cut_respects_k_limit() {
+        let img = make_test_image(20, 20, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+            [255, 255, 0, 255], [128, 0, 128, 255], [0, 128, 128, 255],
+        ]);
+        for k in [2, 4, 6] {
+            let result = median_cut_quantize(&img, k).unwrap();
+            let unique = count_unique_colors(&result);
+            assert!(unique <= k, "MedianCut k={}: got {} unique colors", k, unique);
+        }
+    }
+
+    #[test]
+    fn wu_respects_k_limit() {
+        let img = make_test_image(20, 20, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+            [255, 255, 0, 255], [128, 0, 128, 255], [0, 128, 128, 255],
+        ]);
+        for k in [2, 4, 8, 16, 32, 64] {
+            let result = wu_quantize(&img, k).unwrap();
+            let unique = count_unique_colors(&result);
+            assert!(unique <= k, "Wu k={}: got {} unique colors", k, unique);
+        }
+    }
+
+    // --- Wu supports up to 64 colors ---
+
+    #[test]
+    fn wu_supports_64_colors() {
+        // Image with many distinct colors
+        let mut img = RgbaImage::new(64, 64);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = Rgba([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8, 255]);
+        }
+        let result = wu_quantize(&img, 64).unwrap();
+        let unique = count_unique_colors(&result);
+        // Should be able to produce more than 32 colors now
+        assert!(unique > 32, "Wu k=64 should produce >32 colors, got {}", unique);
+        assert!(unique <= 64, "Wu k=64 should produce <=64 colors, got {}", unique);
+    }
+
+    // --- Deterministic output ---
+
+    #[test]
+    fn oklab_is_deterministic() {
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+        ]);
+        let config = Config { k_colors: 2, ..Default::default() };
+        let r1 = quantize_image_oklab(&img, &config).unwrap();
+        let r2 = quantize_image_oklab(&img, &config).unwrap();
+        assert_eq!(r1.as_raw(), r2.as_raw());
+    }
+
+    #[test]
+    fn median_cut_is_deterministic() {
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+        ]);
+        let r1 = median_cut_quantize(&img, 2).unwrap();
+        let r2 = median_cut_quantize(&img, 2).unwrap();
+        assert_eq!(r1.as_raw(), r2.as_raw());
+    }
+
+    #[test]
+    fn wu_is_deterministic() {
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+        ]);
+        let r1 = wu_quantize(&img, 2).unwrap();
+        let r2 = wu_quantize(&img, 2).unwrap();
+        assert_eq!(r1.as_raw(), r2.as_raw());
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn fewer_unique_colors_than_k() {
+        // Image with only 2 unique colors, but k=16
+        let img = make_test_image(10, 10, &[
+            [255, 0, 0, 255], [0, 0, 255, 255],
+        ]);
+        let config = Config { k_colors: 16, ..Default::default() };
+        let r1 = quantize_image_oklab(&img, &config).unwrap();
+        let r2 = median_cut_quantize(&img, 16).unwrap();
+        let r3 = wu_quantize(&img, 16).unwrap();
+        // Should not crash, and output should have <= 2 unique colors
+        assert!(count_unique_colors(&r1) <= 2);
+        assert!(count_unique_colors(&r2) <= 2);
+        assert!(count_unique_colors(&r3) <= 2);
+    }
+
+    #[test]
+    fn fully_transparent_image() {
+        let img = make_test_image(4, 4, &[[0, 0, 0, 0]]);
+        let config = Config { k_colors: 4, ..Default::default() };
+        let r1 = quantize_image_oklab(&img, &config).unwrap();
+        let r2 = median_cut_quantize(&img, 4).unwrap();
+        let r3 = wu_quantize(&img, 4).unwrap();
+        // Should not crash, all pixels remain transparent
+        for pixel in r1.pixels() { assert_eq!(pixel[3], 0); }
+        for pixel in r2.pixels() { assert_eq!(pixel[3], 0); }
+        for pixel in r3.pixels() { assert_eq!(pixel[3], 0); }
+    }
+
+    #[test]
+    fn invalid_algorithm_id_rejected() {
+        assert!(QuantAlgorithm::try_from_u32(3).is_err());
+        assert!(QuantAlgorithm::try_from_u32(99).is_err());
+        assert!(QuantAlgorithm::try_from_u32(0).is_ok());
+        assert!(QuantAlgorithm::try_from_u32(1).is_ok());
+        assert!(QuantAlgorithm::try_from_u32(2).is_ok());
+    }
+
+    // --- No-resize integration test via process_image_bytes_common ---
+
+    #[test]
+    fn no_resize_preserves_dimensions_all_algorithms() {
+        let src_img = make_test_image(16, 16, &[
+            [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+            [255, 255, 0, 255], [0, 255, 255, 255], [128, 64, 32, 255],
+        ]);
+        let png_bytes = img_to_png_bytes(&src_img);
+
+        for alg in [QuantAlgorithm::KMeansPerceptual, QuantAlgorithm::MedianCut, QuantAlgorithm::Wu] {
+            let config = Config {
+                k_colors: 4,
+                no_resize: true,
+                algorithm: alg,
+                ..Default::default()
+            };
+            let result_bytes = process_image_bytes_common(&png_bytes, Some(config)).unwrap();
+            let result_img = image::load_from_memory(&result_bytes).unwrap();
+            assert_eq!(
+                (result_img.width(), result_img.height()),
+                (16, 16),
+                "Algorithm {:?} changed dimensions in no-resize mode",
+                alg
+            );
+        }
+    }
 }
