@@ -124,8 +124,9 @@ body {
 #controls {
   margin-top: 1.25rem;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 1rem;
+  gap: 0.75rem 1rem;
   background: var(--surface);
   border-radius: var(--radius);
   padding: 0.85rem 1.25rem;
@@ -189,6 +190,81 @@ body {
 }
 
 .controls-slider:disabled {
+  opacity: 0.5;
+}
+
+/* No Resize checkbox + Algorithm dropdown */
+.controls-row-options {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex: 1;
+}
+
+.controls-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.controls-checkbox {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.controls-checkbox:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.controls-checkbox:checked::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0px;
+  width: 5px;
+  height: 9px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.controls-checkbox:disabled {
+  opacity: 0.5;
+}
+
+.controls-algorithm {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.controls-algorithm:focus {
+  border-color: var(--accent);
+}
+
+.controls-algorithm:disabled {
   opacity: 0.5;
 }
 

@@ -1,4 +1,7 @@
-import init, { process_image } from '../../pkg/spritefusion_pixel_snapper.js';
+import init, {
+  process_image,
+  process_image_advanced,
+} from '../../pkg/spritefusion_pixel_snapper.js';
 
 let initialized = false;
 
@@ -11,7 +14,12 @@ export async function initWasm(): Promise<void> {
 export async function processImage(
   bytes: Uint8Array,
   kColors: number,
+  noResize: boolean = false,
+  algorithm: number = 0,
 ): Promise<Uint8Array> {
   await initWasm();
+  if (noResize) {
+    return process_image_advanced(bytes, kColors, true, algorithm);
+  }
   return process_image(bytes, kColors);
 }

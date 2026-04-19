@@ -35,6 +35,8 @@ interface AppState {
   processedUrl: string | null;
   kColors: number;
   isProcessing: boolean;
+  noResize: boolean;
+  algorithm: number;
 }
 
 const state: AppState = {
@@ -46,6 +48,8 @@ const state: AppState = {
   processedUrl: null,
   kColors: 16,
   isProcessing: false,
+  noResize: false,
+  algorithm: 0,
 };
 
 // --- DOM refs ---
@@ -63,6 +67,12 @@ const controls = createControls(controlsEl, {
   onProcess: runProcess,
   onKColorsChange: (k) => {
     state.kColors = k;
+  },
+  onNoResizeChange: (noResize) => {
+    state.noResize = noResize;
+  },
+  onAlgorithmChange: (algorithm) => {
+    state.algorithm = algorithm;
   },
 });
 
@@ -113,7 +123,12 @@ async function runProcess() {
   );
 
   try {
-    const result = await processImage(state.originalBytes, state.kColors);
+    const result = await processImage(
+      state.originalBytes,
+      state.kColors,
+      state.noResize,
+      state.algorithm,
+    );
 
     revokeObjectUrl(state.processedUrl);
     state.processedBytes = result;
@@ -138,6 +153,8 @@ async function runProcess() {
       outputWidth: outDim.width,
       outputHeight: outDim.height,
       kColors: state.kColors,
+      noResize: state.noResize,
+      algorithm: state.algorithm,
     });
     statsEl.classList.remove('hidden');
 
