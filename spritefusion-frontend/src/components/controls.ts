@@ -44,41 +44,56 @@ export function createControls(
   const btnText = btn.querySelector<HTMLSpanElement>('.btn-text')!;
   const btnSpinner = btn.querySelector<HTMLSpanElement>('.btn-spinner')!;
 
+  // Only long enough to swallow keyboard auto-repeat (arrow-key stepping fires
+  // one `change` per step). A committed value shouldn't feel laggy beyond that.
+  const COMMIT_DELAY_MS = 150;
+
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+  function cancelScheduled() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+
+  function scheduleProcess() {
+    cancelScheduled();
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      callbacks.onProcess();
+    }, COMMIT_DELAY_MS);
+  }
+
+  // `input` fires continuously while dragging. Update the readout only — the
+  // expensive algorithms would otherwise run once per pixel of travel, and
+  // since the WASM call blocks the main thread it would stutter the drag too.
   slider.addEventListener('input', () => {
     const k = parseInt(slider.value, 10);
     valueLabel.textContent = String(k);
     callbacks.onKColorsChange(k);
+    cancelScheduled();
+  });
 
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      callbacks.onProcess();
-    }, 300);
+  // `change` fires when the value is committed: on pointer release after a
+  // drag, or per step when using the keyboard.
+  slider.addEventListener('change', () => {
+    callbacks.onKColorsChange(parseInt(slider.value, 10));
+    scheduleProcess();
   });
 
   checkbox.addEventListener('change', () => {
     const checked = checkbox.checked;
     algorithmSelect.classList.toggle('hidden', !checked);
     callbacks.onNoResizeChange(checked);
-
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      callbacks.onProcess();
-    }, 300);
+    scheduleProcess();
   });
 
   algorithmSelect.addEventListener('change', () => {
     callbacks.onAlgorithmChange(parseInt(algorithmSelect.value, 10));
-
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      callbacks.onProcess();
-    }, 300);
+    scheduleProcess();
   });
 
   btn.addEventListener('click', () => {
-    if (debounceTimer) clearTimeout(debounceTimer);
+    cancelScheduled();
     callbacks.onProcess();
   });
 

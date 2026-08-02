@@ -1223,9 +1223,10 @@ fn wu_quantize(img: &RgbaImage, k_colors: usize) -> Result<RgbaImage> {
     Ok(new_img)
 }
 
-/// Spatial Color Quantization via Deterministic Annealing (Puzicha et al.)
-/// Simultaneously performs palette selection and spatial dithering by considering
-/// neighborhood pixel assignments. Excels at low color counts (4-16) for pixel art.
+/// Spatial Color Quantization (pixel-art focused).
+/// Uses spatially-aware hard k-means: each pixel's assignment considers both
+/// color distance to palette entries and what its neighbors are assigned to.
+/// Produces spatially coherent regions while preserving all k colors.
 fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     if config.k_colors == 0 {
         return Err(PixelSnapperError::InvalidInput(
@@ -1237,18 +1238,14 @@ fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     let ww = w as usize;
     let hh = h as usize;
 
-    // Build pixel data in OKLab and coordinate index map
     let mut pixels_lab: Vec<[f32; 3]> = Vec::new();
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
-    // Map from (x, y) to opaque pixel index, None for transparent
     let mut coord_to_idx: Vec<Option<usize>> = vec![None; ww * hh];
 
     for y in 0..hh {
         for x in 0..ww {
             let p = img.get_pixel(x as u32, y as u32);
-            if p[3] == 0 {
-                continue;
-            }
+            if p[3] == 0 { continue; }
             let idx = pixels_lab.len();
             pixels_lab.push(srgb_to_oklab(p[0], p[1], p[2]));
             pixel_coords.push((x, y));
@@ -1257,182 +1254,119 @@ fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     }
 
     let n = pixels_lab.len();
-    if n == 0 {
-        return Ok(img.clone());
-    }
-
+    if n == 0 { return Ok(img.clone()); }
     let k = config.k_colors.min(n);
 
-    // Initialize palette via k-means++ in OKLab, then run a few k-means
-    // iterations to get a solid starting palette before annealing
     let mut rng = ChaCha8Rng::seed_from_u64(config.k_seed);
     let mut palette = kmeans_pp_init_oklab(&pixels_lab, k, &mut rng)?;
     palette = kmeans_refine_oklab(&pixels_lab, &palette, 10);
 
-    // 3x3 neighborhood kernel: (dx, dy, weight)
+    // 3x3 neighborhood: (dx, dy, weight)
     let neighbors: [(i32, i32, f32); 8] = [
         (-1, 0, 0.15), (1, 0, 0.15), (0, -1, 0.15), (0, 1, 0.15),
         (-1, -1, 0.10), (1, -1, 0.10), (-1, 1, 0.10), (1, 1, 0.10),
     ];
 
-    // Soft assignment probabilities: flat [n * k]
-    // Initialize biased toward nearest palette color (not uniform)
-    let mut soft = vec![0.0f32; n * k];
+    // Hard assignments (cluster index per pixel)
+    let mut assignments = vec![0usize; n];
     for i in 0..n {
-        let pixel = &pixels_lab[i];
-        let base = i * k;
-        let mut min_dist = f32::MAX;
-        let mut best_j = 0;
+        let p = &pixels_lab[i];
+        let mut min_d = f32::MAX;
         for j in 0..k {
-            let dl = pixel[0] - palette[j][0];
-            let da = pixel[1] - palette[j][1];
-            let db = pixel[2] - palette[j][2];
+            let dl = p[0] - palette[j][0];
+            let da = p[1] - palette[j][1];
+            let db = p[2] - palette[j][2];
             let d = dl * dl + da * da + db * db;
-            if d < min_dist {
-                min_dist = d;
-                best_j = j;
-            }
+            if d < min_d { min_d = d; assignments[i] = j; }
         }
-        // Soft init: mostly the nearest color, small uniform floor
-        let floor = 0.01 / k as f32;
-        for j in 0..k {
-            soft[base + j] = floor;
-        }
-        soft[base + best_j] = 1.0 - floor * (k - 1) as f32;
     }
 
-    // Deterministic annealing
-    // Lambda is intentionally low (0.05) to prevent spatial coupling from
-    // collapsing palette diversity. The spatial term provides gentle nudging
-    // toward coherent regions without overwhelming the color fidelity term.
-    let t_start: f32 = 1.0;
-    let t_end: f32 = 0.02;
-    let cooling: f32 = 0.92;
-    let lambda: f32 = 0.05;
-    let mut temp = t_start;
+    // Spatial-aware k-means iterations.
+    // Phase 1: standard k-means (10 iters) to get a solid baseline
+    // Phase 2: spatially-biased assignment (20 iters) with increasing spatial weight
+    let spatial_iters = 20usize;
+    let max_spatial_weight = 0.15f32;
 
-    // Track minimum weight threshold for empty-cluster detection
-    let min_weight_frac = 0.5 / k as f32; // expect at least 0.5/k fraction of pixels
+    for iter in 0..spatial_iters {
+        // Spatial weight ramps up linearly over iterations
+        let spatial_w = max_spatial_weight * (iter + 1) as f32 / spatial_iters as f32;
 
-    while temp > t_end {
-        // E-step: update soft assignments
+        // E-step: assign each pixel considering color distance + neighbor bonus
         for i in 0..n {
             let (px, py) = pixel_coords[i];
             let pixel = &pixels_lab[i];
-            let base = i * k;
 
-            let mut max_logit = f32::NEG_INFINITY;
+            let mut best_cost = f32::MAX;
+            let mut best_j = assignments[i];
+
             for j in 0..k {
-                // Unary term: color distance (this is the primary driver)
                 let dl = pixel[0] - palette[j][0];
                 let da = pixel[1] - palette[j][1];
                 let db = pixel[2] - palette[j][2];
-                let unary = dl * dl + da * da + db * db;
+                let color_dist = dl * dl + da * da + db * db;
 
-                // Spatial term: gentle neighbor agreement
-                let mut spatial = 0.0f32;
+                // Count what fraction of neighbors share assignment j
+                let mut neighbor_agreement = 0.0f32;
                 for &(dx, dy, wt) in &neighbors {
                     let nx = px as i32 + dx;
                     let ny = py as i32 + dy;
                     if nx >= 0 && nx < ww as i32 && ny >= 0 && ny < hh as i32 {
                         if let Some(ni) = coord_to_idx[ny as usize * ww + nx as usize] {
-                            spatial += wt * soft[ni * k + j];
+                            if assignments[ni] == j {
+                                neighbor_agreement += wt;
+                            }
                         }
                     }
                 }
 
-                // Unary term sharpens with temperature (drives hard assignments).
-                // Spatial term stays constant (gentle coherence nudge, NOT amplified by 1/T).
-                let logit = -unary / temp + lambda * spatial;
-                soft[base + j] = logit;
-                if logit > max_logit {
-                    max_logit = logit;
+                // Cost = color distance - spatial bonus for neighbor agreement
+                let cost = color_dist - spatial_w * neighbor_agreement;
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_j = j;
                 }
             }
-
-            // Softmax with log-sum-exp trick
-            let mut sum_exp = 0.0f32;
-            for j in 0..k {
-                let v = (soft[base + j] - max_logit).exp();
-                soft[base + j] = v;
-                sum_exp += v;
-            }
-            if sum_exp > 0.0 && sum_exp.is_finite() {
-                let inv = 1.0 / sum_exp;
-                for j in 0..k {
-                    soft[base + j] *= inv;
-                }
-            } else {
-                for j in 0..k {
-                    soft[base + j] = 1.0 / k as f32;
-                }
-            }
+            assignments[i] = best_j;
         }
 
-        // M-step: update palette as weighted average
+        // M-step: update palette as mean of assigned pixels
         let mut sums = vec![[0.0f32; 3]; k];
-        let mut weights = vec![0.0f32; k];
-
+        let mut counts = vec![0usize; k];
         for i in 0..n {
-            let pixel = &pixels_lab[i];
-            let base = i * k;
-            for j in 0..k {
-                let wt = soft[base + j];
-                sums[j][0] += wt * pixel[0];
-                sums[j][1] += wt * pixel[1];
-                sums[j][2] += wt * pixel[2];
-                weights[j] += wt;
-            }
+            let j = assignments[i];
+            sums[j][0] += pixels_lab[i][0];
+            sums[j][1] += pixels_lab[i][1];
+            sums[j][2] += pixels_lab[i][2];
+            counts[j] += 1;
         }
-
-        let min_weight = min_weight_frac * n as f32;
         for j in 0..k {
-            if weights[j] > 1e-10 {
-                let inv = 1.0 / weights[j];
-                let new_c = [sums[j][0] * inv, sums[j][1] * inv, sums[j][2] * inv];
-                if new_c[0].is_finite() && new_c[1].is_finite() && new_c[2].is_finite() {
-                    palette[j] = new_c;
-                } else {
-                    palette[j] = pixels_lab[rng.gen_range(0..n as u64) as usize];
-                }
+            if counts[j] > 0 {
+                let inv = 1.0 / counts[j] as f32;
+                palette[j] = [sums[j][0] * inv, sums[j][1] * inv, sums[j][2] * inv];
             } else {
-                palette[j] = pixels_lab[rng.gen_range(0..n as u64) as usize];
-            }
-
-            // If a cluster has lost almost all weight, reinitialize it from
-            // the pixel farthest from its current nearest palette color
-            if weights[j] < min_weight {
-                // Find the pixel with worst reconstruction error
-                let mut worst_err = 0.0f32;
-                let mut worst_idx = 0;
+                // Empty cluster: steal from largest cluster's most distant pixel
+                let largest = counts.iter().enumerate()
+                    .max_by_key(|(_, c)| *c).map(|(i, _)| i).unwrap_or(0);
+                let mut worst_d = 0.0f32;
+                let mut worst_i = 0;
                 for i in 0..n {
-                    let p = &pixels_lab[i];
-                    let mut min_d = f32::MAX;
-                    for jj in 0..k {
-                        let dl = p[0] - palette[jj][0];
-                        let da = p[1] - palette[jj][1];
-                        let db = p[2] - palette[jj][2];
+                    if assignments[i] == largest {
+                        let p = &pixels_lab[i];
+                        let dl = p[0] - palette[largest][0];
+                        let da = p[1] - palette[largest][1];
+                        let db = p[2] - palette[largest][2];
                         let d = dl * dl + da * da + db * db;
-                        if d < min_d { min_d = d; }
-                    }
-                    if min_d > worst_err {
-                        worst_err = min_d;
-                        worst_idx = i;
+                        if d > worst_d { worst_d = d; worst_i = i; }
                     }
                 }
-                palette[j] = pixels_lab[worst_idx];
+                palette[j] = pixels_lab[worst_i];
+                assignments[worst_i] = j;
             }
         }
-
-        temp *= cooling;
     }
 
-    // Final: 3 k-means iterations to polish palette after annealing
-    palette = kmeans_refine_oklab(&pixels_lab, &palette, 3);
-
-    // Final hard assignment
+    // Final assignment and output
     let srgb_palette: Vec<[u8; 3]> = palette.iter().map(|c| oklab_to_srgb(c)).collect();
-
     let mut new_img = RgbaImage::new(w, h);
     for (x, y, pixel) in img.enumerate_pixels() {
         if pixel[3] == 0 {
@@ -1447,10 +1381,7 @@ fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
             let da = lab[1] - c[1];
             let db = lab[2] - c[2];
             let d = dl * dl + da * da + db * db;
-            if d < min_dist {
-                min_dist = d;
-                best = j;
-            }
+            if d < min_dist { min_dist = d; best = j; }
         }
         let c = srgb_palette[best];
         new_img.put_pixel(x, y, Rgba([c[0], c[1], c[2], pixel[3]]));
@@ -1458,13 +1389,10 @@ fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     Ok(new_img)
 }
 
-/// Grey Wolf Optimization for color quantization (Perez-Delgado 2026)
-/// Population-based metaheuristic: wolves search for optimal palette guided
-/// by alpha/beta/delta hierarchy with exploration-exploitation balance.
-///
-/// Uses weighted representative samples for fast fitness evaluation,
-/// warm-starts from k-means++, and includes early-stopping + palette
-/// diversity enforcement to prevent color collapse.
+/// Grey Wolf Optimization for color quantization (Perez-Delgado 2026).
+/// Repositioned as a short refinement on top of a strong k-means++ base palette.
+/// Uses stratified histogram sampling for fitness, centroid repulsion diversity
+/// pressure, and occupancy-aware repair during the optimization loop.
 fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     if config.k_colors == 0 {
         return Err(PixelSnapperError::InvalidInput(
@@ -1472,112 +1400,105 @@ fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         ));
     }
 
-    // Collect opaque pixels in OKLab
     let pixels_lab: Vec<[f32; 3]> = img
         .pixels()
         .filter_map(|p| {
-            if p[3] == 0 {
-                None
-            } else {
-                Some(srgb_to_oklab(p[0], p[1], p[2]))
-            }
+            if p[3] == 0 { None } else { Some(srgb_to_oklab(p[0], p[1], p[2])) }
         })
         .collect();
 
     let n = pixels_lab.len();
-    if n == 0 {
-        return Ok(img.clone());
-    }
+    if n == 0 { return Ok(img.clone()); }
 
     let k = config.k_colors.min(n);
     let dims = k * 3;
     let pop_size = 20usize;
-    let max_iter = 100usize;
+    let max_iter = 60usize; // Short refinement, not global search
 
     let mut rng = ChaCha8Rng::seed_from_u64(config.k_seed);
 
-    // Build weighted representative sample for fast fitness evaluation.
-    // Use a HashMap to deduplicate quantized colors and count weights.
-    let samples = build_weighted_samples(&pixels_lab, 8000);
+    // Stratified histogram sampling: keeps ALL bins (including rare colors)
+    let samples = build_weighted_samples(&pixels_lab, 10000);
     let sample_colors: Vec<[f32; 3]> = samples.iter().map(|s| s.0).collect();
+    let sample_weights_f32: Vec<f32> = samples.iter().map(|s| s.1 as f32).collect();
     let sample_weights: Vec<f64> = samples.iter().map(|s| s.1 as f64).collect();
     let total_weight: f64 = sample_weights.iter().sum();
 
-    // Initialize all wolves from k-means++ with perturbation for diversity
+    // Strong base palette from k-means++ with 10 refinement iterations
     let kmpp = kmeans_pp_init_oklab(&pixels_lab, k, &mut rng)?;
-    let kmpp_refined = kmeans_refine_oklab(&pixels_lab, &kmpp, 5);
+    let base_palette = kmeans_refine_oklab(&pixels_lab, &kmpp, 10);
+
     let mut population: Vec<Vec<f32>> = Vec::with_capacity(pop_size);
 
-    // Wolf 0: pure k-means++ refined result
-    let mut wolf0: Vec<f32> = Vec::with_capacity(dims);
-    for c in &kmpp_refined {
-        wolf0.push(c[0]); wolf0.push(c[1]); wolf0.push(c[2]);
-    }
+    // Wolf 0: pure base palette
+    let mut wolf0 = Vec::with_capacity(dims);
+    for c in &base_palette { wolf0.push(c[0]); wolf0.push(c[1]); wolf0.push(c[2]); }
     population.push(wolf0);
 
-    // Wolves 1..half: k-means++ with perturbation
-    let half = pop_size / 2;
-    for _ in 1..half {
+    // Remaining wolves: base palette with increasing noise
+    for wi in 1..pop_size {
         let mut wolf = Vec::with_capacity(dims);
-        for c in &kmpp_refined {
-            let noise_scale = 0.15f32;
-            wolf.push(c[0] + (rng.gen::<f32>() - 0.5) * noise_scale);
-            wolf.push(c[1] + (rng.gen::<f32>() - 0.5) * noise_scale);
-            wolf.push(c[2] + (rng.gen::<f32>() - 0.5) * noise_scale);
-        }
-        population.push(wolf);
-    }
-    // Wolves half..pop_size: fully random pixel samples (diverse exploration)
-    for _ in half..pop_size {
-        let mut wolf = Vec::with_capacity(dims);
-        for _ in 0..k {
-            let p = &pixels_lab[rng.gen_range(0..n as u64) as usize];
-            wolf.push(p[0]); wolf.push(p[1]); wolf.push(p[2]);
+        let noise = 0.02 + 0.15 * (wi as f32 / pop_size as f32);
+        for c in &base_palette {
+            wolf.push(c[0] + (rng.gen::<f32>() - 0.5) * noise);
+            wolf.push(c[1] + (rng.gen::<f32>() - 0.5) * noise);
+            wolf.push(c[2] + (rng.gen::<f32>() - 0.5) * noise);
         }
         population.push(wolf);
     }
 
-    // Fitness: weighted MSE over representative samples (not all pixels)
+    // Fitness = weighted MSE + diversity penalty for collapsed centroids
+    let diversity_penalty_weight = 0.001f64;
     let evaluate = |wolf: &[f32]| -> f64 {
-        let mut total = 0.0f64;
+        // MSE term
+        let mut mse = 0.0f64;
         for (si, pixel) in sample_colors.iter().enumerate() {
             let mut min_d = f32::MAX;
             for ci in 0..k {
-                let base = ci * 3;
-                let dl = pixel[0] - wolf[base];
-                let da = pixel[1] - wolf[base + 1];
-                let db = pixel[2] - wolf[base + 2];
+                let b = ci * 3;
+                let dl = pixel[0] - wolf[b];
+                let da = pixel[1] - wolf[b + 1];
+                let db = pixel[2] - wolf[b + 2];
                 let d = dl * dl + da * da + db * db;
                 if d < min_d { min_d = d; }
             }
-            total += min_d as f64 * sample_weights[si];
+            mse += min_d as f64 * sample_weights[si];
         }
-        total / total_weight
+        mse /= total_weight;
+
+        // Diversity penalty: penalize small minimum pairwise distance
+        let mut min_pair_dist = f64::MAX;
+        for i in 0..k {
+            for j in (i + 1)..k {
+                let bi = i * 3;
+                let bj = j * 3;
+                let dl = (wolf[bi] - wolf[bj]) as f64;
+                let da = (wolf[bi + 1] - wolf[bj + 1]) as f64;
+                let db = (wolf[bi + 2] - wolf[bj + 2]) as f64;
+                let d = dl * dl + da * da + db * db;
+                if d < min_pair_dist { min_pair_dist = d; }
+            }
+        }
+        // Penalize: lower min-pair-distance = higher penalty
+        mse + diversity_penalty_weight / (min_pair_dist + 1e-8)
     };
 
     let mut fitness: Vec<f64> = population.iter().map(|w| evaluate(w)).collect();
 
-    // Early stopping state
     let mut best_fitness_ever = f64::MAX;
     let mut stagnation = 0usize;
-    let stagnation_limit = 20usize;
 
-    // Main GWO loop
     for iter in 0..max_iter {
         let mut indices: Vec<usize> = (0..pop_size).collect();
         indices.sort_by(|&a, &b| fitness[a].partial_cmp(&fitness[b]).unwrap_or(Ordering::Equal));
 
         let current_best = fitness[indices[0]];
-
-        // Early stopping on plateau
         if current_best < best_fitness_ever * 0.999 {
             best_fitness_ever = current_best;
             stagnation = 0;
         } else {
             stagnation += 1;
-            if stagnation >= stagnation_limit {
-                break;
-            }
+            if stagnation >= 15 { break; }
         }
 
         let alpha = population[indices[0]].clone();
@@ -1588,47 +1509,39 @@ fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
 
         for wi in 0..pop_size {
             for d in 0..dims {
-                let r1: f32 = rng.gen();
-                let r2: f32 = rng.gen();
-                let a1 = 2.0 * a * r1 - a;
-                let c1 = 2.0 * r2;
-
-                let r1: f32 = rng.gen();
-                let r2: f32 = rng.gen();
-                let a2 = 2.0 * a * r1 - a;
-                let c2 = 2.0 * r2;
-
-                let r1: f32 = rng.gen();
-                let r2: f32 = rng.gen();
-                let a3 = 2.0 * a * r1 - a;
-                let c3 = 2.0 * r2;
+                let r1: f32 = rng.gen(); let r2: f32 = rng.gen();
+                let a1 = 2.0 * a * r1 - a; let c1 = 2.0 * r2;
+                let r1: f32 = rng.gen(); let r2: f32 = rng.gen();
+                let a2 = 2.0 * a * r1 - a; let c2 = 2.0 * r2;
+                let r1: f32 = rng.gen(); let r2: f32 = rng.gen();
+                let a3 = 2.0 * a * r1 - a; let c3 = 2.0 * r2;
 
                 let d_alpha = (c1 * alpha[d] - population[wi][d]).abs();
                 let d_beta = (c2 * beta[d] - population[wi][d]).abs();
                 let d_delta = (c3 * delta[d] - population[wi][d]).abs();
 
-                let x1 = alpha[d] - a1 * d_alpha;
-                let x2 = beta[d] - a2 * d_beta;
-                let x3 = delta[d] - a3 * d_delta;
-
-                let new_val = (x1 + x2 + x3) / 3.0;
+                let new_val = (alpha[d] - a1 * d_alpha
+                    + beta[d] - a2 * d_beta
+                    + delta[d] - a3 * d_delta) / 3.0;
 
                 let clamped = match d % 3 {
                     0 => new_val.clamp(-0.5, 1.5),
                     _ => new_val.clamp(-1.0, 1.0),
                 };
-
                 population[wi][d] = if clamped.is_finite() { clamped } else {
-                    let p = &pixels_lab[rng.gen_range(0..n as u64) as usize];
-                    p[d % 3]
+                    pixels_lab[rng.gen_range(0..n as u64) as usize][d % 3]
                 };
             }
+
+            // Occupancy-aware repair: check this wolf for collapsed centroids
+            // and replace with the worst-served sample color
+            repair_wolf_palette(&mut population[wi], k, &sample_colors, &sample_weights_f32);
 
             fitness[wi] = evaluate(&population[wi]);
         }
     }
 
-    // Extract best wolf's palette
+    // Extract best wolf, final refinement on ALL pixels
     let best_idx = fitness.iter().enumerate()
         .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
@@ -1638,43 +1551,31 @@ fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         .map(|i| [best_wolf[i * 3], best_wolf[i * 3 + 1], best_wolf[i * 3 + 2]])
         .collect();
 
-    // Deduplicate collapsed palette entries and refine iteratively.
-    // Run dedup->refine twice to handle colors that collapse during refinement.
-    for _ in 0..2 {
-        dedup_palette_oklab(&mut palette_lab, &pixels_lab, 8.0);
-        palette_lab = kmeans_refine_oklab(&pixels_lab, &palette_lab, 5);
-    }
+    // Final dedup + refinement on full pixel set
+    dedup_palette_oklab(&mut palette_lab, &pixels_lab, 8.0);
+    palette_lab = kmeans_refine_oklab(&pixels_lab, &palette_lab, 10);
 
     let palette_srgb: Vec<[u8; 3]> = palette_lab.iter().map(|c| oklab_to_srgb(c)).collect();
-
     let mut new_img = RgbaImage::new(img.width(), img.height());
     for (x, y, pixel) in img.enumerate_pixels() {
-        if pixel[3] == 0 {
-            new_img.put_pixel(x, y, *pixel);
-            continue;
-        }
+        if pixel[3] == 0 { new_img.put_pixel(x, y, *pixel); continue; }
         let lab = srgb_to_oklab(pixel[0], pixel[1], pixel[2]);
         let mut min_dist = f32::MAX;
         let mut best = 0;
         for (j, c) in palette_lab.iter().enumerate() {
-            let dl = lab[0] - c[0];
-            let da = lab[1] - c[1];
-            let db = lab[2] - c[2];
+            let dl = lab[0] - c[0]; let da = lab[1] - c[1]; let db = lab[2] - c[2];
             let d = dl * dl + da * da + db * db;
-            if d < min_dist {
-                min_dist = d;
-                best = j;
-            }
+            if d < min_dist { min_dist = d; best = j; }
         }
-        let c = palette_srgb[best];
-        new_img.put_pixel(x, y, Rgba([c[0], c[1], c[2], pixel[3]]));
+        new_img.put_pixel(x, y, Rgba([palette_srgb[best][0], palette_srgb[best][1], palette_srgb[best][2], pixel[3]]));
     }
     Ok(new_img)
 }
 
 /// Differentiable Palette Optimization inspired by AutoPalette/DCQ.
-/// Jointly optimizes palette colors and soft pixel-to-color assignments via
-/// analytical gradient descent with temperature-annealed softmax.
+/// Optimizes palette colors via gradient descent on weighted representative
+/// samples with temperature-annealed softmax assignments. No per-pixel logit
+/// storage -- soft assignments are computed on-the-fly from palette distances.
 fn differentiable_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     if config.k_colors == 0 {
         return Err(PixelSnapperError::InvalidInput(
@@ -1682,88 +1583,76 @@ fn differentiable_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage
         ));
     }
 
-    // Collect opaque pixels in OKLab
     let pixels_lab: Vec<[f32; 3]> = img
         .pixels()
         .filter_map(|p| {
-            if p[3] == 0 {
-                None
-            } else {
-                Some(srgb_to_oklab(p[0], p[1], p[2]))
-            }
+            if p[3] == 0 { None } else { Some(srgb_to_oklab(p[0], p[1], p[2])) }
         })
         .collect();
 
     let n = pixels_lab.len();
-    if n == 0 {
-        return Ok(img.clone());
-    }
+    if n == 0 { return Ok(img.clone()); }
 
     let k = config.k_colors.min(n);
-    let max_iter = 200usize;
-    let lr_palette = 0.01f32;
-    let lr_logits = 0.1f32;
+    let max_iter = 150usize;
+    let lr = 0.02f32;
     let tau_start = 2.0f32;
-    let tau_end = 0.1f32;
-    let logit_clamp = 50.0f32;
+    let tau_end = 0.05f32;
     let grad_clip = 10.0f32;
 
     let mut rng = ChaCha8Rng::seed_from_u64(config.k_seed);
 
-    // Initialize palette via k-means++
-    let mut palette = kmeans_pp_init_oklab(&pixels_lab, k, &mut rng)?;
+    // Weighted representative samples for gradient computation
+    let samples = build_weighted_samples(&pixels_lab, 10000);
+    let sample_colors: Vec<[f32; 3]> = samples.iter().map(|s| s.0).collect();
+    let sample_weights: Vec<f32> = samples.iter().map(|s| s.1 as f32).collect();
+    let total_weight: f32 = sample_weights.iter().sum();
+    let ns = sample_colors.len();
 
-    // Initialize logits biased toward nearest palette color
-    let mut logits = vec![0.0f32; n * k];
-    for i in 0..n {
-        for j in 0..k {
-            let dl = pixels_lab[i][0] - palette[j][0];
-            let da = pixels_lab[i][1] - palette[j][1];
-            let db = pixels_lab[i][2] - palette[j][2];
-            logits[i * k + j] = -(dl * dl + da * da + db * db);
-        }
-    }
+    // Initialize palette via k-means++ + refinement
+    let kmpp = kmeans_pp_init_oklab(&pixels_lab, k, &mut rng)?;
+    let mut palette = kmeans_refine_oklab(&pixels_lab, &kmpp, 10);
 
-    // Optimization loop
+    // Preallocate reusable buffers
+    let mut probs = vec![0.0f32; k];
+
+    let mut prev_loss = f64::MAX;
+    let mut stagnation = 0usize;
+
     for iter in 0..max_iter {
         let tau = tau_start * (tau_end / tau_start).powf(iter as f32 / (max_iter - 1).max(1) as f32);
         let inv_tau = 1.0 / tau;
 
-        // Gradients
-        let mut grad_palette = vec![[0.0f32; 3]; k];
-        let mut grad_logits = vec![0.0f32; n * k];
+        let mut grad = vec![[0.0f32; 3]; k];
+        let mut cluster_weight = vec![0.0f32; k];
+        let mut total_loss = 0.0f64;
 
-        let inv_n = 1.0 / n as f32;
+        for si in 0..ns {
+            let pixel = &sample_colors[si];
+            let sw = sample_weights[si];
 
-        for i in 0..n {
-            let base = i * k;
-            let pixel = &pixels_lab[i];
-
-            // Softmax with temperature (log-sum-exp trick)
-            let mut max_l = f32::NEG_INFINITY;
+            // Compute softmax probabilities from palette distances (no stored logits)
+            let mut max_logit = f32::NEG_INFINITY;
             for j in 0..k {
-                let v = (logits[base + j].clamp(-logit_clamp, logit_clamp)) * inv_tau;
-                if v > max_l {
-                    max_l = v;
-                }
+                let dl = pixel[0] - palette[j][0];
+                let da = pixel[1] - palette[j][1];
+                let db = pixel[2] - palette[j][2];
+                let logit = -(dl * dl + da * da + db * db) * inv_tau;
+                probs[j] = logit;
+                if logit > max_logit { max_logit = logit; }
             }
 
-            let mut probs = vec![0.0f32; k];
             let mut sum_exp = 0.0f32;
             for j in 0..k {
-                let v = ((logits[base + j].clamp(-logit_clamp, logit_clamp)) * inv_tau - max_l).exp();
+                let v = (probs[j] - max_logit).exp();
                 probs[j] = v;
                 sum_exp += v;
             }
             if sum_exp > 0.0 && sum_exp.is_finite() {
-                let inv_sum = 1.0 / sum_exp;
-                for j in 0..k {
-                    probs[j] *= inv_sum;
-                }
+                let inv = 1.0 / sum_exp;
+                for j in 0..k { probs[j] *= inv; }
             } else {
-                for j in 0..k {
-                    probs[j] = 1.0 / k as f32;
-                }
+                for j in 0..k { probs[j] = 1.0 / k as f32; }
             }
 
             // Reconstructed color
@@ -1774,151 +1663,96 @@ fn differentiable_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage
                 recon[2] += probs[j] * palette[j][2];
             }
 
-            // Error vector
-            let err = [
-                recon[0] - pixel[0],
-                recon[1] - pixel[1],
-                recon[2] - pixel[2],
-            ];
+            let err = [recon[0] - pixel[0], recon[1] - pixel[1], recon[2] - pixel[2]];
+            total_loss += (err[0] * err[0] + err[1] * err[1] + err[2] * err[2]) as f64 * sw as f64;
 
-            // Palette gradient: d(loss)/d(palette[j]) = (2/N) * p_ij * error
+            // Palette gradient weighted by sample weight
+            let inv_tw = sw / total_weight;
             for j in 0..k {
-                let scale = 2.0 * inv_n * probs[j];
-                grad_palette[j][0] += scale * err[0];
-                grad_palette[j][1] += scale * err[1];
-                grad_palette[j][2] += scale * err[2];
-            }
-
-            // Logits gradient: d(loss)/d(logit[i][j]) = (2/tau) * p_ij * dot(err, palette[j] - recon)
-            for j in 0..k {
-                let diff = [
-                    palette[j][0] - recon[0],
-                    palette[j][1] - recon[1],
-                    palette[j][2] - recon[2],
-                ];
-                let dot = err[0] * diff[0] + err[1] * diff[1] + err[2] * diff[2];
-                grad_logits[base + j] = 2.0 * inv_tau * probs[j] * dot;
+                let scale = 2.0 * inv_tw * probs[j];
+                grad[j][0] += scale * err[0];
+                grad[j][1] += scale * err[1];
+                grad[j][2] += scale * err[2];
+                cluster_weight[j] += probs[j] * sw;
             }
         }
 
-        // Gradient norm clipping for palette
-        let mut palette_norm_sq = 0.0f32;
+        total_loss /= total_weight as f64;
+
+        // Early stopping
+        if total_loss > prev_loss * 0.999 {
+            stagnation += 1;
+            if stagnation >= 20 { break; }
+        } else {
+            stagnation = 0;
+        }
+        prev_loss = total_loss;
+
+        // Gradient norm clipping
+        let mut norm_sq = 0.0f32;
         for j in 0..k {
-            palette_norm_sq += grad_palette[j][0] * grad_palette[j][0]
-                + grad_palette[j][1] * grad_palette[j][1]
-                + grad_palette[j][2] * grad_palette[j][2];
+            norm_sq += grad[j][0] * grad[j][0] + grad[j][1] * grad[j][1] + grad[j][2] * grad[j][2];
         }
-        let palette_norm = palette_norm_sq.sqrt();
-        let palette_scale = if palette_norm > grad_clip {
-            grad_clip / palette_norm
-        } else {
-            1.0
-        };
-
-        // Gradient norm clipping for logits
-        let mut logits_norm_sq = 0.0f32;
-        for v in &grad_logits {
-            logits_norm_sq += v * v;
-        }
-        let logits_norm = logits_norm_sq.sqrt();
-        let logits_scale = if logits_norm > grad_clip {
-            grad_clip / logits_norm
-        } else {
-            1.0
-        };
+        let scale = if norm_sq.sqrt() > grad_clip { grad_clip / norm_sq.sqrt() } else { 1.0 };
 
         // Update palette
         let mut any_nan = false;
         for j in 0..k {
-            palette[j][0] -= lr_palette * palette_scale * grad_palette[j][0];
-            palette[j][1] -= lr_palette * palette_scale * grad_palette[j][1];
-            palette[j][2] -= lr_palette * palette_scale * grad_palette[j][2];
+            palette[j][0] -= lr * scale * grad[j][0];
+            palette[j][1] -= lr * scale * grad[j][1];
+            palette[j][2] -= lr * scale * grad[j][2];
             if !palette[j][0].is_finite() || !palette[j][1].is_finite() || !palette[j][2].is_finite() {
                 any_nan = true;
             }
         }
 
-        // Recovery: reinitialize from k-means++ if NaN detected
         if any_nan {
-            palette = kmeans_pp_init_oklab(&pixels_lab, k, &mut rng)?;
-            // Re-initialize logits
-            for i in 0..n {
-                for j in 0..k {
-                    let dl = pixels_lab[i][0] - palette[j][0];
-                    let da = pixels_lab[i][1] - palette[j][1];
-                    let db = pixels_lab[i][2] - palette[j][2];
-                    logits[i * k + j] = -(dl * dl + da * da + db * db);
-                }
-            }
+            palette = kmeans_refine_oklab(&pixels_lab,
+                &kmeans_pp_init_oklab(&pixels_lab, k, &mut rng)?, 5);
+            prev_loss = f64::MAX;
             continue;
         }
 
-        // Update logits
-        for idx in 0..n * k {
-            logits[idx] -= lr_logits * logits_scale * grad_logits[idx];
-        }
-
-        // Check for empty clusters and reinitialize
-        // Compute total soft weight per palette color
-        let mut total_weight = vec![0.0f32; k];
-        for i in 0..n {
-            let base = i * k;
-            // Quick re-compute probs for weight check
-            let mut max_l = f32::NEG_INFINITY;
-            for j in 0..k {
-                let v = logits[base + j].clamp(-logit_clamp, logit_clamp) * inv_tau;
-                if v > max_l {
-                    max_l = v;
-                }
-            }
-            let mut sum_exp = 0.0f32;
-            let mut local_probs = vec![0.0f32; k];
-            for j in 0..k {
-                let v = (logits[base + j].clamp(-logit_clamp, logit_clamp) * inv_tau - max_l).exp();
-                local_probs[j] = v;
-                sum_exp += v;
-            }
-            if sum_exp > 0.0 && sum_exp.is_finite() {
-                let inv = 1.0 / sum_exp;
-                for j in 0..k {
-                    total_weight[j] += local_probs[j] * inv;
-                }
-            }
-        }
-
+        // Empty-cluster repair: if a cluster has < 1% of weight, reinitialize
+        // from the sample with worst reconstruction error
+        let min_cw = total_weight * 0.01 / k as f32;
         for j in 0..k {
-            if total_weight[j] < 1e-6 {
-                // Reinitialize from pixel with highest reconstruction error
-                // (simplified: just use a random pixel)
-                palette[j] = pixels_lab[rng.gen_range(0..n as u64) as usize];
+            if cluster_weight[j] < min_cw {
+                let mut worst_err = 0.0f32;
+                let mut worst_si = 0;
+                for si in 0..ns {
+                    let p = &sample_colors[si];
+                    let mut min_d = f32::MAX;
+                    for jj in 0..k {
+                        let dl = p[0] - palette[jj][0];
+                        let da = p[1] - palette[jj][1];
+                        let db = p[2] - palette[jj][2];
+                        let d = dl * dl + da * da + db * db;
+                        if d < min_d { min_d = d; }
+                    }
+                    if min_d > worst_err { worst_err = min_d; worst_si = si; }
+                }
+                palette[j] = sample_colors[worst_si];
             }
         }
     }
 
-    // Final hard assignment via nearest palette color in OKLab
-    let srgb_palette: Vec<[u8; 3]> = palette.iter().map(|c| oklab_to_srgb(c)).collect();
+    // Final k-means refinement on ALL pixels
+    palette = kmeans_refine_oklab(&pixels_lab, &palette, 5);
 
+    let srgb_palette: Vec<[u8; 3]> = palette.iter().map(|c| oklab_to_srgb(c)).collect();
     let mut new_img = RgbaImage::new(img.width(), img.height());
     for (x, y, pixel) in img.enumerate_pixels() {
-        if pixel[3] == 0 {
-            new_img.put_pixel(x, y, *pixel);
-            continue;
-        }
+        if pixel[3] == 0 { new_img.put_pixel(x, y, *pixel); continue; }
         let lab = srgb_to_oklab(pixel[0], pixel[1], pixel[2]);
         let mut min_dist = f32::MAX;
         let mut best = 0;
         for (j, c) in palette.iter().enumerate() {
-            let dl = lab[0] - c[0];
-            let da = lab[1] - c[1];
-            let db = lab[2] - c[2];
+            let dl = lab[0] - c[0]; let da = lab[1] - c[1]; let db = lab[2] - c[2];
             let d = dl * dl + da * da + db * db;
-            if d < min_dist {
-                min_dist = d;
-                best = j;
-            }
+            if d < min_dist { min_dist = d; best = j; }
         }
-        let c = srgb_palette[best];
-        new_img.put_pixel(x, y, Rgba([c[0], c[1], c[2], pixel[3]]));
+        new_img.put_pixel(x, y, Rgba([srgb_palette[best][0], srgb_palette[best][1], srgb_palette[best][2], pixel[3]]));
     }
     Ok(new_img)
 }
@@ -2118,6 +1952,55 @@ fn dedup_palette_oklab(
 
         // Safety: don't loop forever
         if pass >= k * 2 { break; }
+    }
+}
+
+/// Repair a wolf's palette in-place: find collapsed centroids (sRGB distance < 4)
+/// and replace them with the sample color having worst reconstruction error.
+fn repair_wolf_palette(
+    wolf: &mut [f32],
+    k: usize,
+    sample_colors: &[[f32; 3]],
+    sample_weights: &[f32],
+) {
+    if k <= 1 { return; }
+
+    // Convert wolf to sRGB palette for duplicate detection
+    let srgb: Vec<[u8; 3]> = (0..k).map(|i| {
+        oklab_to_srgb(&[wolf[i * 3], wolf[i * 3 + 1], wolf[i * 3 + 2]])
+    }).collect();
+
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let dr = srgb[i][0] as f32 - srgb[j][0] as f32;
+            let dg = srgb[i][1] as f32 - srgb[j][1] as f32;
+            let db = srgb[i][2] as f32 - srgb[j][2] as f32;
+            if dr * dr + dg * dg + db * db < 16.0 { // sRGB dist < 4
+                // Find worst-served sample
+                let mut worst_err = 0.0f32;
+                let mut worst_si = 0;
+                for (si, p) in sample_colors.iter().enumerate() {
+                    let mut min_d = f32::MAX;
+                    for ci in 0..k {
+                        let b = ci * 3;
+                        let dl = p[0] - wolf[b];
+                        let da = p[1] - wolf[b + 1];
+                        let dbb = p[2] - wolf[b + 2];
+                        let d = dl * dl + da * da + dbb * dbb;
+                        if d < min_d { min_d = d; }
+                    }
+                    let weighted = min_d * sample_weights[si];
+                    if weighted > worst_err {
+                        worst_err = weighted;
+                        worst_si = si;
+                    }
+                }
+                wolf[j * 3] = sample_colors[worst_si][0];
+                wolf[j * 3 + 1] = sample_colors[worst_si][1];
+                wolf[j * 3 + 2] = sample_colors[worst_si][2];
+                return; // Fix one per call, will be called every iteration
+            }
+        }
     }
 }
 

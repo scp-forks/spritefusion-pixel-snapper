@@ -8,6 +8,11 @@ import {
   getOutputFilename,
   revokeObjectUrl,
 } from './utils/image-helpers';
+import {
+  createResultCache,
+  makeCacheKey,
+  type CachedResult,
+} from './utils/result-cache';
 import { createDropzone, validateFile } from './components/dropzone';
 import { createControls } from './components/controls';
 import { createComparison } from './components/comparison';
@@ -30,9 +35,10 @@ interface AppState {
   originalFile: File | null;
   originalBytes: Uint8Array | null;
   originalUrl: string | null;
+  originalWidth: number;
+  originalHeight: number;
   originalUniqueColors: number;
-  processedBytes: Uint8Array | null;
-  processedUrl: string | null;
+  current: CachedResult | null;
   kColors: number;
   isProcessing: boolean;
   noResize: boolean;
@@ -43,14 +49,26 @@ const state: AppState = {
   originalFile: null,
   originalBytes: null,
   originalUrl: null,
+  originalWidth: 0,
+  originalHeight: 0,
   originalUniqueColors: 0,
-  processedBytes: null,
-  processedUrl: null,
+  current: null,
   kColors: 16,
   isProcessing: false,
   noResize: false,
   algorithm: 0,
 };
+
+const resultCache = createResultCache();
+
+// Bumped on every new source image so in-flight work from the previous one can
+// be discarded instead of being cached against the wrong image.
+let fileSeq = 0;
+// Bumped on every process request so a slow result that has been superseded is
+// still cached, but not displayed.
+let requestSeq = 0;
+// Set when a debounced change lands mid-run; replayed once the run finishes.
+let pendingRun = false;
 
 // --- DOM refs ---
 const controlsEl = document.getElementById('controls')!;
@@ -80,27 +98,39 @@ const comparison = createComparison(comparisonEl);
 const stats = createStats(statsEl);
 
 createToolbar(toolbarEl, {
-  getProcessedBytes: () => state.processedBytes,
+  getProcessedBytes: () => state.current?.bytes ?? null,
   getFilename: () => getOutputFilename(state.originalFile?.name ?? 'image.png'),
 });
 
 // --- Handlers ---
 async function handleFile(file: File) {
+  const token = ++fileSeq;
+
+  const bytes = await fileToUint8Array(file);
+  if (token !== fileSeq) return;
+
   state.originalFile = file;
-  state.originalBytes = await fileToUint8Array(file);
+  state.originalBytes = bytes;
+
+  // Every cached result describes the previous image, so none of them survive.
+  resultCache.clear();
+  state.current = null;
 
   revokeObjectUrl(state.originalUrl);
   state.originalUrl = bytesToObjectUrl(state.originalBytes);
 
-  // Count unique colors in background (non-blocking)
-  countUniqueColors(state.originalUrl).then((count) => {
-    state.originalUniqueColors = count;
-  });
+  const origDim = await getImageDimensions(state.originalUrl);
+  if (token !== fileSeq) return;
+  state.originalWidth = origDim.width;
+  state.originalHeight = origDim.height;
 
-  // Reset processed state
-  revokeObjectUrl(state.processedUrl);
-  state.processedBytes = null;
-  state.processedUrl = null;
+  // Count unique colors in background (non-blocking)
+  state.originalUniqueColors = 0;
+  countUniqueColors(state.originalUrl).then((count) => {
+    if (token !== fileSeq) return;
+    state.originalUniqueColors = count;
+    if (state.current) renderStats();
+  });
 
   dropzone.collapse();
   controlsEl.classList.remove('hidden');
@@ -111,9 +141,61 @@ async function handleFile(file: File) {
   runProcess();
 }
 
-async function runProcess() {
-  if (!state.originalBytes || state.isProcessing) return;
+function renderStats() {
+  const entry = state.current;
+  if (!entry) return;
+  stats.update({
+    originalWidth: state.originalWidth,
+    originalHeight: state.originalHeight,
+    originalUniqueColors: state.originalUniqueColors,
+    outputWidth: entry.width,
+    outputHeight: entry.height,
+    kColors: entry.kColors,
+    outputUniqueColors: entry.uniqueColors,
+    noResize: entry.noResize,
+    algorithm: entry.algorithm,
+  });
+}
 
+/** Show a result. Synchronous, so a cache hit swaps the preview instantly. */
+function applyResult(entry: CachedResult) {
+  state.current = entry;
+  resultCache.pin(entry.key);
+
+  if (comparisonEl.classList.contains('hidden')) {
+    comparisonEl.classList.remove('hidden');
+    comparison.setImages(state.originalUrl!, entry.url);
+  } else {
+    comparison.updateProcessed(entry.url);
+  }
+
+  renderStats();
+  statsEl.classList.remove('hidden');
+  toolbarEl.classList.remove('hidden');
+}
+
+async function runProcess() {
+  if (!state.originalBytes) return;
+
+  // Snapshot the settings this run is for; state can move on while we await.
+  const kColors = state.kColors;
+  const noResize = state.noResize;
+  const algorithm = state.algorithm;
+  const key = makeCacheKey(kColors, noResize, algorithm);
+  const seq = ++requestSeq;
+
+  const cached = resultCache.get(key);
+  if (cached) {
+    applyResult(cached);
+    return;
+  }
+
+  if (state.isProcessing) {
+    pendingRun = true;
+    return;
+  }
+
+  const token = fileSeq;
   state.isProcessing = true;
   controls.setProcessing(true);
 
@@ -123,49 +205,49 @@ async function runProcess() {
   );
 
   try {
-    const result = await processImage(
+    const bytes = await processImage(
       state.originalBytes,
-      state.kColors,
-      state.noResize,
-      state.algorithm,
+      kColors,
+      noResize,
+      algorithm,
     );
+    const url = bytesToObjectUrl(bytes);
 
-    revokeObjectUrl(state.processedUrl);
-    state.processedBytes = result;
-    state.processedUrl = bytesToObjectUrl(result);
+    const [outDim, outputUniqueColors] = await Promise.all([
+      getImageDimensions(url),
+      countUniqueColors(url),
+    ]);
 
-    if (comparisonEl.classList.contains('hidden')) {
-      comparisonEl.classList.remove('hidden');
-      comparison.setImages(state.originalUrl!, state.processedUrl);
-    } else {
-      comparison.updateProcessed(state.processedUrl);
+    // A new image landed mid-run: this result belongs to the old one.
+    if (token !== fileSeq) {
+      revokeObjectUrl(url);
+      return;
     }
 
-    // Compute and show stats
-    const [origDim, outDim, outputUniqueColors] = await Promise.all([
-      getImageDimensions(state.originalUrl!),
-      getImageDimensions(state.processedUrl),
-      countUniqueColors(state.processedUrl),
-    ]);
-    stats.update({
-      originalWidth: origDim.width,
-      originalHeight: origDim.height,
-      originalUniqueColors: state.originalUniqueColors,
-      outputWidth: outDim.width,
-      outputHeight: outDim.height,
-      kColors: state.kColors,
-      outputUniqueColors,
-      noResize: state.noResize,
-      algorithm: state.algorithm,
-    });
-    statsEl.classList.remove('hidden');
+    const entry: CachedResult = {
+      key,
+      bytes,
+      url,
+      width: outDim.width,
+      height: outDim.height,
+      uniqueColors: outputUniqueColors,
+      kColors,
+      noResize,
+      algorithm,
+    };
+    resultCache.set(entry);
 
-    toolbarEl.classList.remove('hidden');
+    // Only paint if nothing newer has been requested in the meantime.
+    if (seq === requestSeq) applyResult(entry);
   } catch (err) {
     showToast(`Processing failed: ${err}`);
   } finally {
     state.isProcessing = false;
     controls.setProcessing(false);
+    if (pendingRun) {
+      pendingRun = false;
+      runProcess();
+    }
   }
 }
 
