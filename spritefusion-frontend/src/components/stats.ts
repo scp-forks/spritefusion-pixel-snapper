@@ -1,3 +1,5 @@
+import { CLEANUP_BLOCKS, CLEANUP_NAMES } from '../settings';
+
 export interface StatsData {
   originalWidth: number;
   originalHeight: number;
@@ -8,6 +10,8 @@ export interface StatsData {
   outputUniqueColors: number;
   noResize: boolean;
   algorithm: number;
+  cleanup: number;
+  gridScale: number;
 }
 
 const ALGORITHM_NAMES = [
@@ -33,12 +37,23 @@ export function createStats(container: HTMLElement) {
 
       let thirdGroup: string;
       if (data.noResize) {
+        const cleanupName = CLEANUP_NAMES[data.cleanup] ?? 'Off';
+        // The engine falls back to a coarser grid when cells would go under 2 px, and
+        // does not report which grid it used, so this is what was asked for.
+        const cleanupValue =
+          data.cleanup === CLEANUP_BLOCKS && data.gridScale !== 1
+            ? `${cleanupName}, ${data.gridScale}x finer grid requested`
+            : cleanupName;
         thirdGroup = `
           <div class="stat-group">
             <span class="stat-group-label">Mode</span>
             <div class="stat">
               <span class="stat-value">${ALGORITHM_NAMES[data.algorithm] ?? 'K-Means'}</span>
               <span class="stat-label">Algorithm</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value">${cleanupValue}</span>
+              <span class="stat-label">Cleanup</span>
             </div>
           </div>`;
       } else {

@@ -8,11 +8,13 @@ import {
   getOutputFilename,
   revokeObjectUrl,
 } from './utils/image-helpers';
+import { createResultCache, type CachedResult } from './utils/result-cache';
 import {
-  createResultCache,
-  makeCacheKey,
-  type CachedResult,
-} from './utils/result-cache';
+  DEFAULT_SETTINGS,
+  effectiveSettings,
+  settingsKey,
+  type ProcessSettings,
+} from './settings';
 import { createDropzone, validateFile } from './components/dropzone';
 import { createControls } from './components/controls';
 import { createComparison } from './components/comparison';
@@ -39,10 +41,9 @@ interface AppState {
   originalHeight: number;
   originalUniqueColors: number;
   current: CachedResult | null;
-  kColors: number;
+  /** What the controls currently say; hidden controls keep their value. */
+  settings: ProcessSettings;
   isProcessing: boolean;
-  noResize: boolean;
-  algorithm: number;
 }
 
 const state: AppState = {
@@ -53,10 +54,8 @@ const state: AppState = {
   originalHeight: 0,
   originalUniqueColors: 0,
   current: null,
-  kColors: 16,
+  settings: { ...DEFAULT_SETTINGS },
   isProcessing: false,
-  noResize: false,
-  algorithm: 0,
 };
 
 const resultCache = createResultCache();
@@ -84,13 +83,19 @@ const dropzone = createDropzone(document.getElementById('dropzone')!, {
 const controls = createControls(controlsEl, {
   onProcess: runProcess,
   onKColorsChange: (k) => {
-    state.kColors = k;
+    state.settings.kColors = k;
   },
   onNoResizeChange: (noResize) => {
-    state.noResize = noResize;
+    state.settings.noResize = noResize;
   },
   onAlgorithmChange: (algorithm) => {
-    state.algorithm = algorithm;
+    state.settings.algorithm = algorithm;
+  },
+  onCleanupChange: (cleanup) => {
+    state.settings.cleanup = cleanup;
+  },
+  onGridScaleChange: (gridScale) => {
+    state.settings.gridScale = gridScale;
   },
 });
 
@@ -150,10 +155,12 @@ function renderStats() {
     originalUniqueColors: state.originalUniqueColors,
     outputWidth: entry.width,
     outputHeight: entry.height,
-    kColors: entry.kColors,
+    kColors: entry.settings.kColors,
     outputUniqueColors: entry.uniqueColors,
-    noResize: entry.noResize,
-    algorithm: entry.algorithm,
+    noResize: entry.settings.noResize,
+    algorithm: entry.settings.algorithm,
+    cleanup: entry.settings.cleanup,
+    gridScale: entry.settings.gridScale,
   });
 }
 
@@ -178,10 +185,8 @@ async function runProcess() {
   if (!state.originalBytes) return;
 
   // Snapshot the settings this run is for; state can move on while we await.
-  const kColors = state.kColors;
-  const noResize = state.noResize;
-  const algorithm = state.algorithm;
-  const key = makeCacheKey(kColors, noResize, algorithm);
+  const settings = effectiveSettings(state.settings);
+  const key = settingsKey(settings);
   const seq = ++requestSeq;
 
   const cached = resultCache.get(key);
@@ -205,12 +210,7 @@ async function runProcess() {
   );
 
   try {
-    const bytes = await processImage(
-      state.originalBytes,
-      kColors,
-      noResize,
-      algorithm,
-    );
+    const bytes = await processImage(state.originalBytes, settings);
     const url = bytesToObjectUrl(bytes);
 
     const [outDim, outputUniqueColors] = await Promise.all([
@@ -231,9 +231,7 @@ async function runProcess() {
       width: outDim.width,
       height: outDim.height,
       uniqueColors: outputUniqueColors,
-      kColors,
-      noResize,
-      algorithm,
+      settings,
     };
     resultCache.set(entry);
 

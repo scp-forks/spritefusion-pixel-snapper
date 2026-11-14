@@ -1,7 +1,8 @@
 import init, {
-  process_image,
-  process_image_advanced,
+  ProcessOptions,
+  process_image_with,
 } from '../../pkg/spritefusion_pixel_snapper.js';
+import { effectiveSettings, type ProcessSettings } from './settings';
 
 let initialized = false;
 
@@ -11,15 +12,26 @@ export async function initWasm(): Promise<void> {
   initialized = true;
 }
 
+/**
+ * Run the engine. With default settings this returns exactly what the original
+ * `process_image` export returns (the Rust test suite pins that).
+ */
 export async function processImage(
   bytes: Uint8Array,
-  kColors: number,
-  noResize: boolean = false,
-  algorithm: number = 0,
+  settings: ProcessSettings,
 ): Promise<Uint8Array> {
   await initWasm();
-  if (noResize) {
-    return process_image_advanced(bytes, kColors, true, algorithm);
+  const s = effectiveSettings(settings);
+  const opts = new ProcessOptions();
+  try {
+    opts.k_colors = s.kColors;
+    opts.no_resize = s.noResize;
+    opts.algorithm = s.algorithm;
+    opts.cleanup = s.cleanup;
+    opts.grid_scale = s.gridScale;
+    return process_image_with(bytes, opts);
+  } finally {
+    // wasm-bindgen objects live in WASM memory and are not garbage collected.
+    opts.free();
   }
-  return process_image(bytes, kColors);
 }

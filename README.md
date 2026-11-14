@@ -87,6 +87,20 @@ The command accepts an optional k-colors argument:
 cargo run input.png output.png 16
 ```
 
+Optional flags after the color count:
+
+| Flag | Effect |
+|---|---|
+| `--no-resize` | Keep the original dimensions; reduce the palette only |
+| `--algorithm=<0-5>` | Quantizer for `--no-resize`: 0 K-Means (perceptual), 1 Median Cut, 2 Wu, 3 Spatial, 4 Grey Wolf, 5 Differentiable |
+| `--cleanup=off\|blocks` | With `--no-resize`: `blocks` gives every detected grid cell one color, painted at the original size. Removes the speckle that palette reduction leaves on blurry pixel art |
+| `--grid-scale=<1-16>` | Work on a grid this many times finer than the detected one. Use 1.5, 2 or 3 when details are being lost. Applies to the snapped output and to `--cleanup=blocks`. Cells are never smaller than 2 px |
+| `--stats` | Print one JSON line describing the output: size, grid, color count, and how many same-color regions are under 4 px and under 16 px |
+
+```bash
+cargo run input.png output.png 16 --no-resize --cleanup=blocks --grid-scale=2
+```
+
 ### 🌐 WASM (library)
 
 For integrating Pixel Snapper into your own web project.
@@ -106,6 +120,27 @@ const outputPng = process_image(inputBytes, 16); // 16 colors
 ```
 
 The `process_image` function takes raw image bytes (PNG/JPEG) and an optional color count, and returns PNG bytes of the processed image.
+
+For the other modes, pass an options object. With default options it returns exactly what `process_image` returns.
+
+```js
+import init, { ProcessOptions, process_image_with } from './pkg/spritefusion_pixel_snapper.js';
+
+await init();
+const opts = new ProcessOptions(); // a plain object literal is not accepted
+opts.k_colors = 16;
+opts.no_resize = true;  // keep the original dimensions
+opts.algorithm = 0;     // 0-5, as for the CLI
+opts.cleanup = 1;       // 0 off, 1 blocks
+opts.grid_scale = 2;    // 1 to 16
+try {
+  const outputPng = process_image_with(inputBytes, opts);
+} finally {
+  opts.free();          // wasm-bindgen objects are not garbage collected
+}
+```
+
+Invalid options throw; nothing is silently clamped.
 
 ## Acknowledgments
 

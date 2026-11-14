@@ -4,8 +4,6 @@
 //! (cell voting, un-mixing, the sieve) needs labels instead, and those are recovered
 //! here from the quantizer's output rather than by rewriting the quantizers.
 
-// Phase 1 adds these as plumbing; the first callers arrive in Phase 2.
-#![allow(dead_code)]
 
 use crate::{PixelSnapperError, Result};
 use image::{Rgba, RgbaImage};
@@ -29,6 +27,7 @@ impl IndexedImage<'_> {
         self.source.width() as usize
     }
 
+    #[allow(dead_code)] // first non-test caller arrives with the Smooth cleanup
     pub fn height(&self) -> usize {
         self.source.height() as usize
     }

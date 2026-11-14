@@ -13,9 +13,12 @@ use std::fmt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod cleanup;
 mod grid;
 mod indexed;
 mod regions;
+#[cfg(test)]
+mod test_util;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +45,56 @@ impl QuantAlgorithm {
     }
 }
 
+/// Spatial cleanup applied after palette reduction in no-resize mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Cleanup {
+    /// Palette reduction only: every pixel takes its nearest palette colour.
+    Off = 0,
+    /// One colour per grid cell, painted back at the original size.
+    Blocks = 1,
+}
+
+impl Cleanup {
+    fn try_from_u32(v: u32) -> std::result::Result<Self, String> {
+        match v {
+            0 => Ok(Cleanup::Off),
+            1 => Ok(Cleanup::Blocks),
+            _ => Err(format!("Invalid cleanup ID: {}. Valid values: 0 (Off), 1 (Blocks)", v)),
+        }
+    }
+
+    fn from_name(name: &str) -> std::result::Result<Self, String> {
+        match name {
+            "off" => Ok(Cleanup::Off),
+            "blocks" => Ok(Cleanup::Blocks),
+            _ => Err(format!("Invalid cleanup '{}'. Valid values: off, blocks", name)),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Cleanup::Off => "off",
+            Cleanup::Blocks => "blocks",
+        }
+    }
+}
+
+/// Largest accepted `grid_scale`. Cells never go under 2 px whatever is asked for, so
+/// this only keeps nonsense out.
+const MAX_GRID_SCALE: f64 = 16.0;
+
+fn validate_grid_scale(scale: f64) -> std::result::Result<f64, String> {
+    if scale.is_finite() && (1.0..=MAX_GRID_SCALE).contains(&scale) {
+        Ok(scale)
+    } else {
+        Err(format!(
+            "Invalid grid scale: {}. It must be between 1 and {}",
+            scale, MAX_GRID_SCALE
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Config {
@@ -64,6 +117,11 @@ pub struct Config {
     max_step_ratio: f64,
     no_resize: bool,
     algorithm: QuantAlgorithm,
+    /// No-resize mode only. See [`Cleanup`].
+    cleanup: Cleanup,
+    /// How many times finer than the detected grid to work, 1.0 = as detected.
+    /// Applies to the snap output and to `Cleanup::Blocks`.
+    grid_scale: f64,
     /// CLI only: print one JSON line of output statistics after saving.
     #[allow(dead_code)]
     print_stats: bool,
@@ -87,6 +145,8 @@ impl Default for Config {
             max_step_ratio: 1.8, // Lowered from 3.0 to catch more skew cases
             no_resize: false,
             algorithm: QuantAlgorithm::KMeansPerceptual,
+            cleanup: Cleanup::Off,
+            grid_scale: 1.0,
             print_stats: false,
         }
     }
@@ -194,41 +254,180 @@ fn main() -> Result<()> {
     process_image(&config)
 }
 
-fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Result<Vec<u8>> {
-    let config = config.unwrap_or_default();
+/// The finished image and, when one was used, the grid it was built on.
+struct PipelineOutput {
+    image: RgbaImage,
+    grid: Option<grid::Grid>,
+}
 
+fn run_pipeline(rgba_img: &RgbaImage, config: &Config) -> Result<PipelineOutput> {
+    validate_grid_scale(config.grid_scale).map_err(PixelSnapperError::InvalidInput)?;
+
+    if config.no_resize {
+        // No-resize mode: palette reduction at the original dimensions...
+        let quantized = match config.algorithm {
+            QuantAlgorithm::KMeansPerceptual => quantize_image_oklab(rgba_img, config)?,
+            QuantAlgorithm::MedianCut => median_cut_quantize(rgba_img, config.k_colors)?,
+            QuantAlgorithm::Wu => wu_quantize(rgba_img, config.k_colors)?,
+            QuantAlgorithm::SpatialQuantization => spatial_quantize(rgba_img, config)?,
+            QuantAlgorithm::GreyWolfOptimization => gwo_quantize(rgba_img, config)?,
+            QuantAlgorithm::DifferentiablePalette => differentiable_quantize(rgba_img, config)?,
+        };
+        // ...then, optionally, the spatial step the quantizers lack.
+        match config.cleanup {
+            Cleanup::Off => Ok(PipelineOutput { image: quantized, grid: None }),
+            Cleanup::Blocks => {
+                let cleaned = cleanup::blocks(rgba_img, &quantized, config)?;
+                Ok(PipelineOutput { image: cleaned.image, grid: cleaned.grid })
+            }
+        }
+    } else {
+        if config.cleanup != Cleanup::Off {
+            return Err(PixelSnapperError::InvalidInput(format!(
+                "Cleanup '{}' needs no-resize mode: the snap output is already one colour per cell",
+                config.cleanup.name()
+            )));
+        }
+        // Legacy pipeline: RGB k-means quantize + grid detection + resampling. With
+        // grid_scale == 1 this is byte-identical to what it has always produced.
+        let quantized_img = quantize_image(rgba_img, config)?;
+        let base = grid::detect_grid(&quantized_img, config)?;
+        let grid = cleanup::grid_at_scale(base, &quantized_img, config, config.grid_scale);
+        let image = resample(&quantized_img, &grid.cols, &grid.rows)?;
+        Ok(PipelineOutput { image, grid: Some(grid) })
+    }
+}
+
+/// Decode, process, encode as PNG. Also returns the grid size (columns, rows) when the
+/// output was built on one.
+fn process_image_bytes_detailed(
+    input_bytes: &[u8],
+    config: &Config,
+) -> Result<(Vec<u8>, Option<(usize, usize)>)> {
     let img = image::load_from_memory(input_bytes)?;
     let (width, height) = img.dimensions();
 
     validate_image_dimensions(width, height)?;
 
     let rgba_img = img.to_rgba8();
+    let output = run_pipeline(&rgba_img, config)?;
 
-    let output_img = if config.no_resize {
-        // No-resize mode: only palette reduction, preserve original dimensions
-        match config.algorithm {
-            QuantAlgorithm::KMeansPerceptual => quantize_image_oklab(&rgba_img, &config)?,
-            QuantAlgorithm::MedianCut => median_cut_quantize(&rgba_img, config.k_colors)?,
-            QuantAlgorithm::Wu => wu_quantize(&rgba_img, config.k_colors)?,
-            QuantAlgorithm::SpatialQuantization => spatial_quantize(&rgba_img, &config)?,
-            QuantAlgorithm::GreyWolfOptimization => gwo_quantize(&rgba_img, &config)?,
-            QuantAlgorithm::DifferentiablePalette => differentiable_quantize(&rgba_img, &config)?,
-        }
-    } else {
-        // Existing pipeline: RGB k-means quantize + grid detection + resampling
-        let quantized_img = quantize_image(&rgba_img, &config)?;
-        let grid = grid::detect_grid(&quantized_img, &config)?;
-        resample(&quantized_img, &grid.cols, &grid.rows)?
-    };
-
-    // Returns bytes for both implementations
     let mut output_bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
-    output_img
+    output
+        .image
         .write_to(&mut cursor, image::ImageFormat::Png)
         .map_err(|e| PixelSnapperError::ImageError(e))?;
 
-    Ok(output_bytes)
+    let grid_size = output.grid.map(|g| (g.cols.len() - 1, g.rows.len() - 1));
+    Ok((output_bytes, grid_size))
+}
+
+#[allow(dead_code)] // WASM entry points and tests
+fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Result<Vec<u8>> {
+    let config = config.unwrap_or_default();
+    process_image_bytes_detailed(input_bytes, &config).map(|(bytes, _)| bytes)
+}
+
+/// A JS number that must be a whole number in `u32` range. wasm-bindgen converts a JS
+/// number to `u32` with `>>> 0`, which turns NaN into 0, 1.5 into 1 and 4294967312
+/// into 16; options therefore cross the boundary as `f64` and are checked here.
+#[allow(dead_code)]
+fn checked_u32(name: &str, value: f64) -> std::result::Result<u32, String> {
+    if value.is_finite() && value >= 0.0 && value <= u32::MAX as f64 && value.fract() == 0.0 {
+        Ok(value as u32)
+    } else {
+        Err(format!("{} must be a whole number between 0 and {}, got {}", name, u32::MAX, value))
+    }
+}
+
+/// Validate caller-supplied options into a [`Config`]. Shared by `process_image_with`
+/// and its tests; nothing is clamped or rounded, anything out of range is an error.
+#[allow(dead_code)]
+fn config_from_options(
+    k_colors: f64,
+    no_resize: bool,
+    algorithm: f64,
+    cleanup: f64,
+    grid_scale: f64,
+) -> std::result::Result<Config, String> {
+    let k_colors = checked_u32("k_colors", k_colors)?;
+    let algorithm = checked_u32("algorithm", algorithm)?;
+    let cleanup = checked_u32("cleanup", cleanup)?;
+    if k_colors == 0 {
+        return Err("k_colors must be greater than 0".to_string());
+    }
+    let cleanup = Cleanup::try_from_u32(cleanup)?;
+    if cleanup != Cleanup::Off && !no_resize {
+        return Err(format!(
+            "Cleanup '{}' needs no_resize: the snap output is already one colour per cell",
+            cleanup.name()
+        ));
+    }
+    Ok(Config {
+        k_colors: k_colors as usize,
+        no_resize,
+        algorithm: QuantAlgorithm::try_from_u32(algorithm)?,
+        cleanup,
+        grid_scale: validate_grid_scale(grid_scale)?,
+        ..Default::default()
+    })
+}
+
+/// Options for [`process_image_with`]. Build with `new ProcessOptions()` in JS and set
+/// the fields that differ from the defaults; a plain object literal is not accepted.
+/// Fields are added as features land, always with a default that changes nothing.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessOptions {
+    // Numeric fields are `f64` on purpose: see `checked_u32`.
+    /// Palette size, a whole number of at least 1. Default 16.
+    pub k_colors: f64,
+    /// Keep the original dimensions (palette reduction, plus `cleanup`). Default false.
+    pub no_resize: bool,
+    /// Quantizer for no-resize mode, 0-5. Default 0 (k-means, perceptual).
+    pub algorithm: f64,
+    /// No-resize only. 0 = off, 1 = blocks (one colour per grid cell). Default 0.
+    pub cleanup: f64,
+    /// Work on a grid this many times finer than the detected one, 1 to 16. Default 1.
+    pub grid_scale: f64,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl ProcessOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> ProcessOptions {
+        ProcessOptions {
+            k_colors: 16.0,
+            no_resize: false,
+            algorithm: 0.0,
+            cleanup: 0.0,
+            grid_scale: 1.0,
+        }
+    }
+}
+
+/// WASM entry point taking an options object. With default options it returns exactly
+/// what `process_image` returns.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn process_image_with(
+    input_bytes: &[u8],
+    opts: &ProcessOptions,
+) -> std::result::Result<Vec<u8>, wasm_bindgen::JsValue> {
+    let config = config_from_options(
+        opts.k_colors,
+        opts.no_resize,
+        opts.algorithm,
+        opts.cleanup,
+        opts.grid_scale,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
+
+    process_image_bytes_common(input_bytes, Some(config))
+        .map_err(|e| wasm_bindgen::JsValue::from(e))
 }
 
 /// WASM entry point
@@ -306,7 +505,8 @@ fn parse_args() -> Option<Config> {
         }
     }
 
-    // Optional flags: --no-resize, --algorithm=<0-5>, --stats
+    // Optional flags: --no-resize, --algorithm=<0-5>, --cleanup=off|blocks,
+    //                 --grid-scale=<1..16>, --stats
     // Algorithm IDs: 0=K-Means Perceptual, 1=Median Cut, 2=Wu's Optimal,
     //                3=Spatial, 4=Grey Wolf, 5=Differentiable Palette
     for arg in args.iter().skip(3) {
@@ -314,6 +514,16 @@ fn parse_args() -> Option<Config> {
             config.no_resize = true;
         } else if arg == "--stats" {
             config.print_stats = true;
+        } else if let Some(name) = arg.strip_prefix("--cleanup=") {
+            match Cleanup::from_name(name) {
+                Ok(cleanup) => config.cleanup = cleanup,
+                Err(e) => eprintln!("Warning: {}", e),
+            }
+        } else if let Some(scale_str) = arg.strip_prefix("--grid-scale=") {
+            match scale_str.parse::<f64>().map_err(|e| e.to_string()).and_then(validate_grid_scale) {
+                Ok(scale) => config.grid_scale = scale,
+                Err(e) => eprintln!("Warning: invalid grid scale '{}' ({}), using 1", scale_str, e),
+            }
         } else if let Some(alg_str) = arg.strip_prefix("--algorithm=") {
             match alg_str.parse::<u32>() {
                 Ok(v) => match QuantAlgorithm::try_from_u32(v) {
@@ -340,7 +550,7 @@ fn process_image(config: &Config) -> Result<()> {
         PixelSnapperError::ProcessingError(format!("Failed to read input file: {}", e))
     })?;
 
-    let output_bytes = process_image_bytes_common(&img_bytes, Some(config.clone()))?;
+    let (output_bytes, grid_size) = process_image_bytes_detailed(&img_bytes, config)?;
 
     std::fs::write(&config.output_path, &output_bytes).map_err(|e| {
         PixelSnapperError::ProcessingError(format!("Failed to write output file: {}", e))
@@ -350,7 +560,7 @@ fn process_image(config: &Config) -> Result<()> {
 
     if config.print_stats {
         let output_img = image::load_from_memory(&output_bytes)?.to_rgba8();
-        println!("{}", stats_json(config, &regions::image_stats(&output_img)));
+        println!("{}", stats_json(config, &regions::image_stats(&output_img), grid_size));
     }
     Ok(())
 }
@@ -359,7 +569,11 @@ fn process_image(config: &Config) -> Result<()> {
 /// lines can be committed as a regression baseline (`scripts/corpus-check.sh`).
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
-fn stats_json(config: &Config, stats: &regions::ImageStats) -> String {
+fn stats_json(
+    config: &Config,
+    stats: &regions::ImageStats,
+    grid_size: Option<(usize, usize)>,
+) -> String {
     let raw_name = std::path::Path::new(&config.input_path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -373,12 +587,19 @@ fn stats_json(config: &Config, stats: &regions::ImageStats) -> String {
             c => input_name.push(c),
         }
     }
+    let grid = match grid_size {
+        Some((cols, rows)) => format!("[{},{}]", cols, rows),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
+        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"cleanup\":\"{}\",\"grid_scale\":{},\"grid\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
         input_name,
         if config.no_resize { "no-resize" } else { "snap" },
         config.k_colors,
         config.algorithm as u32,
+        config.cleanup.name(),
+        config.grid_scale,
+        grid,
         stats.width,
         stats.height,
         stats.unique_colors,
@@ -2574,6 +2795,7 @@ fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{jitter, synthetic_lattice};
 
     /// Create a small test image with known colors
     fn make_test_image(w: u32, h: u32, colors: &[[u8; 4]]) -> RgbaImage {
@@ -3044,70 +3266,8 @@ mod tests {
         fnv1a(&bytes)
     }
 
-    /// Cells of random palette colours with the given column widths and row heights,
-    /// optionally box-blurred (3x3) and noised: a stand-in for AI "pixel art".
-    /// Returns the image and the palette index of every cell, row-major.
-    fn synthetic_lattice(
-        col_widths: &[u32],
-        row_heights: &[u32],
-        palette: &[[u8; 3]],
-        blur: bool,
-        noise: i32,
-        seed: u64,
-    ) -> (RgbaImage, Vec<usize>) {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let (w, h) = (col_widths.iter().sum::<u32>(), row_heights.iter().sum::<u32>());
-        let truth: Vec<usize> = (0..col_widths.len() * row_heights.len())
-            .map(|_| rng.gen_range(0..palette.len()))
-            .collect();
-
-        let cell_of = |sizes: &[u32], pos: u32| -> usize {
-            let mut end = 0;
-            sizes.iter().position(|&s| { end += s; pos < end }).unwrap()
-        };
-        let mut sharp = vec![[0f32; 3]; (w * h) as usize];
-        for y in 0..h {
-            let cy = cell_of(row_heights, y);
-            for x in 0..w {
-                let c = palette[truth[cy * col_widths.len() + cell_of(col_widths, x)]];
-                sharp[(y * w + x) as usize] = [c[0] as f32, c[1] as f32, c[2] as f32];
-            }
-        }
-
-        let mut img = RgbaImage::new(w, h);
-        for y in 0..h as i32 {
-            for x in 0..w as i32 {
-                let mut acc = [0f32; 3];
-                let mut n = 0f32;
-                let r = if blur { 1 } else { 0 };
-                for dy in -r..=r {
-                    for dx in -r..=r {
-                        let (sx, sy) = (x + dx, y + dy);
-                        if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
-                            let s = sharp[(sy as u32 * w + sx as u32) as usize];
-                            for ch in 0..3 { acc[ch] += s[ch]; }
-                            n += 1.0;
-                        }
-                    }
-                }
-                let mut px = [0u8, 0, 0, 255];
-                for ch in 0..3 {
-                    let v = (acc[ch] / n).round() as i32 + if noise > 0 { jitter(&mut rng, noise) } else { 0 };
-                    px[ch] = v.clamp(0, 255) as u8;
-                }
-                img.put_pixel(x as u32, y as u32, Rgba(px));
-            }
-        }
-        (img, truth)
-    }
-
     fn decode(png: &[u8]) -> RgbaImage {
         image::load_from_memory(png).unwrap().to_rgba8()
-    }
-
-    /// Deterministic noise in [-amp, amp] for test images.
-    fn jitter(rng: &mut ChaCha8Rng, amp: i32) -> i32 {
-        rng.gen_range(-amp..=amp)
     }
 
     /// The legacy snap path (`process_image` in WASM, the CLI without flags) must stay
@@ -3386,12 +3546,67 @@ mod tests {
     }
 
     #[test]
+    fn options_are_validated_not_clamped() {
+        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0).unwrap();
+        assert_eq!(ok.k_colors, 8);
+        assert!(ok.no_resize);
+        assert_eq!(ok.algorithm, QuantAlgorithm::SpatialQuantization);
+        assert_eq!(ok.cleanup, Cleanup::Blocks);
+        assert_eq!(ok.grid_scale, 2.0);
+
+        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0).is_err(), "zero colours");
+        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0).is_err(), "unknown algorithm");
+        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0).is_err(), "unknown cleanup");
+        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0).is_err(), "cleanup without no_resize");
+        for scale in [0.0, 0.99, 16.5, -2.0, f64::NAN, f64::INFINITY] {
+            assert!(config_from_options(16.0, true, 0.0, 0.0, scale).is_err(), "grid scale {scale}");
+        }
+        // What `>>> 0` would have turned into something valid.
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 1.5, 4294967296.0, 4294967312.0] {
+            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0).is_err(), "k_colors {bad}");
+            assert!(config_from_options(16.0, true, bad, 0.0, 1.0).is_err(), "algorithm {bad}");
+            assert!(config_from_options(16.0, true, 0.0, bad, 1.0).is_err(), "cleanup {bad}");
+        }
+        assert_eq!(checked_u32("x", 4294967295.0), Ok(u32::MAX));
+        assert_eq!(checked_u32("x", 0.0), Ok(0));
+    }
+
+    /// `process_image_with` with default options must be the legacy snap output.
+    #[test]
+    fn default_options_reproduce_the_legacy_output() {
+        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0).unwrap();
+        for (name, bytes, golden) in golden_fixtures() {
+            let png = process_image_bytes_common(bytes, Some(config.clone())).unwrap();
+            assert_eq!(fnv1a(&png), golden.png, "fixture {name}");
+        }
+    }
+
+    #[test]
+    fn snap_mode_honours_grid_scale_and_rejects_cleanup() {
+        let (img, _) = synthetic_lattice(&[8; 16], &[8; 16], &crate::test_util::DISTINCT_8, true, 4, 2);
+        let base = run_pipeline(&img, &Config { k_colors: 8, ..Default::default() }).unwrap();
+        let fine = run_pipeline(&img, &Config { k_colors: 8, grid_scale: 2.0, ..Default::default() }).unwrap();
+        // The walker lands on 16 or 17 cells per axis for this 16-cell lattice.
+        let (bw, bh) = base.image.dimensions();
+        assert!((16..=17).contains(&bw) && (16..=17).contains(&bh), "{bw}x{bh}");
+        let (fw, fh) = fine.image.dimensions();
+        assert!(fw >= 2 * bw - 2 && fh >= 2 * bh - 2, "{fw}x{fh} against {bw}x{bh}");
+        let grid = fine.grid.unwrap();
+        assert_eq!(((grid.cols.len() - 1) as u32, (grid.rows.len() - 1) as u32), (fw, fh));
+
+        let bad = Config { cleanup: Cleanup::Blocks, ..Default::default() };
+        assert!(run_pipeline(&img, &bad).is_err());
+        let bad = Config { grid_scale: 0.5, ..Default::default() };
+        assert!(run_pipeline(&img, &bad).is_err());
+    }
+
+    #[test]
     fn stats_json_escapes_control_characters() {
         let config = Config { input_path: "a\nb\tc\u{1}.png".to_string(), ..Default::default() };
         let stats = regions::ImageStats {
             width: 1, height: 1, unique_colors: 1, regions: 1, regions_lt4: 1, regions_lt16: 1,
         };
-        let line = stats_json(&config, &stats);
+        let line = stats_json(&config, &stats, None);
         assert!(!line.contains('\n') && !line.contains('\t'));
         assert!(line.starts_with(r#"{"input":"a\u000ab\u0009c\u0001.png","mode":"snap""#), "{line}");
     }
@@ -3408,8 +3623,11 @@ mod tests {
             width: 4, height: 3, unique_colors: 2, regions: 5, regions_lt4: 1, regions_lt16: 5,
         };
         assert_eq!(
-            stats_json(&config, &stats),
-            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
+            stats_json(&config, &stats, None),
+            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"cleanup":"off","grid_scale":1,"grid":null,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
         );
+        let blocks = Config { cleanup: Cleanup::Blocks, grid_scale: 1.5, ..config };
+        assert!(stats_json(&blocks, &stats, Some((12, 9)))
+            .contains(r#""cleanup":"blocks","grid_scale":1.5,"grid":[12,9],"#));
     }
 }

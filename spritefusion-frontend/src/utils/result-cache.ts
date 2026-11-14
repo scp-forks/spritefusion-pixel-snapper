@@ -1,31 +1,20 @@
+import type { ProcessSettings } from '../settings';
+
 export interface CachedResult {
+  /** `settingsKey(settings)`. */
   key: string;
   bytes: Uint8Array;
   url: string;
   width: number;
   height: number;
   uniqueColors: number;
-  kColors: number;
-  noResize: boolean;
-  algorithm: number;
+  /** The effective settings that produced this result. */
+  settings: ProcessSettings;
 }
 
 // Bounds so a long session of slider-dragging can't pin unbounded blob memory.
 const MAX_ENTRIES = 64;
 const MAX_BYTES = 96 * 1024 * 1024;
-
-/**
- * Identifies a processing result. In snap mode the WASM entry point is
- * `process_image`, which takes no algorithm, so including it would store the
- * same output under six different keys.
- */
-export function makeCacheKey(
-  kColors: number,
-  noResize: boolean,
-  algorithm: number,
-): string {
-  return noResize ? `noresize:${kColors}:${algorithm}` : `snap:${kColors}`;
-}
 
 export function createResultCache() {
   // Map iterates in insertion order, so re-inserting on read gives LRU ordering.

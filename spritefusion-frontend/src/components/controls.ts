@@ -1,8 +1,12 @@
+import { CLEANUP_BLOCKS } from '../settings';
+
 export interface ControlsCallbacks {
   onProcess: () => void;
   onKColorsChange: (k: number) => void;
   onNoResizeChange: (noResize: boolean) => void;
   onAlgorithmChange: (algorithm: number) => void;
+  onCleanupChange: (cleanup: number) => void;
+  onGridScaleChange: (gridScale: number) => void;
 }
 
 export function createControls(
@@ -21,13 +25,25 @@ export function createControls(
         <input type="checkbox" class="controls-checkbox" />
         <span>No Resize</span>
       </label>
-      <select class="controls-algorithm hidden">
+      <select class="controls-select controls-algorithm hidden" title="Palette algorithm">
         <option value="0">K-Means (Perceptual)</option>
         <option value="1">Median Cut</option>
         <option value="2">Wu's Optimal</option>
         <option value="3">Spatial (Pixel Art)</option>
         <option value="4">Grey Wolf Optimization</option>
         <option value="5">Differentiable Palette</option>
+      </select>
+      <select class="controls-select controls-cleanup hidden"
+        title="Cleanup removes the speckle that palette reduction leaves. Blocks gives every grid cell one colour, at the original size.">
+        <option value="0">Cleanup: Off</option>
+        <option value="1">Cleanup: Blocks</option>
+      </select>
+      <select class="controls-select controls-grid-scale hidden"
+        title="Blocks works on the detected pixel grid. Choose a finer grid if details are being lost.">
+        <option value="1">Grid: Auto</option>
+        <option value="1.5">Grid: 1.5x finer</option>
+        <option value="2">Grid: 2x finer</option>
+        <option value="3">Grid: 3x finer</option>
       </select>
     </div>
     <button class="controls-btn" type="button">
@@ -40,6 +56,17 @@ export function createControls(
   const valueLabel = container.querySelector<HTMLSpanElement>('.controls-value')!;
   const checkbox = container.querySelector<HTMLInputElement>('.controls-checkbox')!;
   const algorithmSelect = container.querySelector<HTMLSelectElement>('.controls-algorithm')!;
+  const cleanupSelect = container.querySelector<HTMLSelectElement>('.controls-cleanup')!;
+  const gridScaleSelect = container.querySelector<HTMLSelectElement>('.controls-grid-scale')!;
+
+  // Each control is shown only where it has an effect.
+  function syncVisibility() {
+    const noResize = checkbox.checked;
+    const blocks = noResize && parseInt(cleanupSelect.value, 10) === CLEANUP_BLOCKS;
+    algorithmSelect.classList.toggle('hidden', !noResize);
+    cleanupSelect.classList.toggle('hidden', !noResize);
+    gridScaleSelect.classList.toggle('hidden', !blocks);
+  }
   const btn = container.querySelector<HTMLButtonElement>('.controls-btn')!;
   const btnText = btn.querySelector<HTMLSpanElement>('.btn-text')!;
   const btnSpinner = btn.querySelector<HTMLSpanElement>('.btn-spinner')!;
@@ -81,9 +108,19 @@ export function createControls(
   });
 
   checkbox.addEventListener('change', () => {
-    const checked = checkbox.checked;
-    algorithmSelect.classList.toggle('hidden', !checked);
-    callbacks.onNoResizeChange(checked);
+    syncVisibility();
+    callbacks.onNoResizeChange(checkbox.checked);
+    scheduleProcess();
+  });
+
+  cleanupSelect.addEventListener('change', () => {
+    syncVisibility();
+    callbacks.onCleanupChange(parseInt(cleanupSelect.value, 10));
+    scheduleProcess();
+  });
+
+  gridScaleSelect.addEventListener('change', () => {
+    callbacks.onGridScaleChange(parseFloat(gridScaleSelect.value));
     scheduleProcess();
   });
 
@@ -103,6 +140,8 @@ export function createControls(
       slider.disabled = processing;
       checkbox.disabled = processing;
       algorithmSelect.disabled = processing;
+      cleanupSelect.disabled = processing;
+      gridScaleSelect.disabled = processing;
       btnText.textContent = processing ? 'Processing...' : 'Process';
       btnSpinner.classList.toggle('hidden', !processing);
     },

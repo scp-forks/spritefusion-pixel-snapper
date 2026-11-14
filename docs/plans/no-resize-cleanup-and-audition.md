@@ -429,3 +429,54 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
   argument so far for the opt-in fitter of Phase 4, which should carry a plateau-tolerant
   estimate; whether to also fix the legacy default is a decision for the owner.
 
+### Phase 2 — done
+
+- `src/cleanup.rs`: `blocks`, `vote_cells`, `paint_cells`, `grid_at_scale`. Config gained
+  `cleanup` and `grid_scale`; CLI `--cleanup=off|blocks`, `--grid-scale=`; WASM
+  `ProcessOptions` + `process_image_with`; frontend Cleanup and Grid selects, shown only
+  where they have an effect. `scripts/wasm-smoke.mjs` runs the generated package under
+  Node and is part of `corpus-check.sh`. Checked in the running app with Playwright.
+- **Remeasured with the real pipeline** (16 colours, k-means), as the plan required:
+
+  | image | grid at scale 1 | regions < 16 px, plain → Blocks | grid at scale 2 |
+  |---|---|---|---|
+  | wolf | 187×187 | 26 399 → 68 (0.3 %) | 363×352 |
+  | coliseum | 187×99 | 17 045 → 0 | 374×198 |
+  | ogtrail | 200×116 | 9 963 → 158 | 362×211 |
+  | city | 109×119 | 34 565 → 508 | 196×202 |
+  | sprite sheet | 251×253 | 24 227 → 918 | 452×464 |
+  | cat | 228×223 | 185 376 → 1 958 | 382×391 |
+
+  No output has a region under 4 px. At scale 2 a single cell is often under 16 px, so
+  the "under 16 px" count stops meaning speckle there. Blocks runs in 0.1–0.5 s natively.
+- Both "done when" checks hold: wolf at scale 1 leaves 0.3 % of the small regions with the
+  ear outline unbroken, and the coliseum at scale 2 keeps its window rows.
+- **The grid depends on which quantized image it is detected on.** Blocks detects on the
+  selected algorithm's output, as planned; snap mode detects on its own RGB k-means. On
+  the wolf that gives 187×187 against 205×208, and on the sprite sheet 251×253 (right)
+  against 169×169 (wrong). Neither input is consistently better. The fitter of Phase 4
+  works on the source image and removes the dependence.
+- **The legacy grid is about half a pixel off on average.** On a synthetic blurred
+  lattice, Blocks puts 90 % of pixels right (75 % for the plain reduction): every cell
+  has the right colour, but about four cuts in ten sit one pixel early, because the
+  profile's gradient is centred on a pixel while an edge lies between two. The test
+  `regular_blurred_lattice_is_recovered` pins the 90 % as a floor; Phase 4 should raise it.
+- Deviations from the plan:
+  - `ProcessOptions` has only the fields that do something so far (`k_colors`,
+    `no_resize`, `algorithm`, `cleanup`, `grid_scale`). The others arrive with their
+    phases, each defaulting to "no change".
+  - `grid_scale` also applies in snap mode (a finer small output). It was nearly free and
+    Phase 5 needs it.
+  - A scale that cannot be honoured falls back to the nearest smaller standard scale
+    (3 → 2 → 1.5 → 1) instead of failing; `--stats` reports the grid actually used.
+  - Lattice tests ask for 12 colours on an 8-colour lattice: with exactly 8, k-means
+    spends slots on blend colours and merges two real ones, which no spatial step can
+    undo. This is the "fringe colours take palette slots" effect from the research.
+  - The irregular lattice test passes at the planned 95 %; a `grid_scale = 2` test from
+    the first draft of the plan was kept.
+  - Numeric `ProcessOptions` fields are `f64`, not `u32`: wasm-bindgen's `u32` conversion
+    happens before any validation and turns NaN into 0 and 1.5 into 1.
+- Codex review (`docs/reviews/phase-2-review.md`): six findings, all fixed. The two that
+  mattered: Blocks voted on the detected grid's 1 px cells (a 1 px checkerboard came back
+  untouched), and invalid JS numbers were coerced into valid options before validation.
+

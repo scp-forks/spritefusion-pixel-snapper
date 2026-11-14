@@ -1,7 +1,5 @@
 //! The pixel grid of an image: where the cuts between logical pixels fall.
 
-// Phase 1 adds these as plumbing; the first callers arrive in Phase 2.
-#![allow(dead_code)]
 
 use crate::{
     compute_profiles, estimate_step_size, resolve_step_sizes, sanitize_cuts, stabilize_both_axes,
@@ -33,6 +31,15 @@ pub struct Grid {
 impl Grid {
     pub fn cell_count(&self) -> usize {
         (self.cols.len() - 1) * (self.rows.len() - 1)
+    }
+
+    /// The same grid with every cell under [`MIN_CELL_PX`] merged into a neighbour.
+    /// The legacy walker emits such cells; the snap output keeps them (it is frozen),
+    /// everything new must call this first.
+    pub fn with_min_cells(mut self) -> Grid {
+        self.cols = merge_narrow_intervals(self.cols);
+        self.rows = merge_narrow_intervals(self.rows);
+        self
     }
 }
 
