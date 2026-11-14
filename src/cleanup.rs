@@ -32,25 +32,34 @@ pub fn grid_at_scale(base: Grid, profiles: &Profiles, config: &Config, scale: f6
         .unwrap_or(base)
 }
 
-/// **Blocks** ("snap in place"): one colour per grid cell, painted back at the
-/// original size.
-///
-/// * Colour: the majority label among the cell's pixels with `alpha > 0`, counted after
-///   un-mixing (see [`unmix`]); ties go to the label that appears first in the image.
-/// * Alpha: every pixel keeps its own source alpha. Fully transparent pixels are copied
-///   from the source, so an opaque feature inside a mostly transparent cell keeps its
-///   shape and takes the cell's colour.
-pub fn blocks(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Result<Cleaned> {
+/// Everything Blocks needs that does not depend on which grid is used: computed once,
+/// then rendered on as many grids as the caller wants to offer.
+pub struct BlocksPrep<'a> {
+    /// The quantized image as labels, after un-mixing. This is what cells vote on.
+    unmixed: IndexedImage<'a>,
+    /// The labels as the quantizer left them, before un-mixing.
+    #[allow(dead_code)] // read by the detail vote
+    raw_labels: Vec<u16>,
+    pub profiles: Profiles,
+    /// The detected grid, with no cell under 2 px.
+    pub base: Grid,
+}
+
+/// Prepare Blocks for `source`, or `None` when there is nothing to snap (no opaque
+/// pixel, or an image under 3 px on a side, which is too small to hold a grid).
+pub fn prepare_blocks<'a>(
+    source: &'a RgbaImage,
+    quantized: &RgbaImage,
+    config: &Config,
+) -> Result<Option<BlocksPrep<'a>>> {
     let mut ix = index_image(source, quantized)?;
-    // A grid needs at least 3 px on each side; smaller images have nothing to snap.
     if ix.palette.is_empty() || source.width() < 3 || source.height() < 3 {
-        return Ok(Cleaned { image: render(&ix), grid: None });
+        return Ok(None);
     }
 
     // The detected grid can contain 1 px cells. A cell that small cannot hold a vote
     // (it would keep the very speckle this is meant to remove), so they are merged
-    // away before anything else. `grid_at_scale` keeps the guarantee: every refinement
-    // enforces it, and its last resort is this base grid.
+    // away before anything else. Every refinement keeps the guarantee.
     let profiles = grid::profiles(source, quantized, config)?;
     let base = grid::detect(&profiles, source.width(), source.height(), config)?.with_min_cells();
 
@@ -58,15 +67,42 @@ pub fn blocks(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Res
     // between instead of for an unrelated third. (Measured in research on the coliseum
     // at twice the detected grid: 208 stray regions against 637 when voting on the raw
     // labels.)
+    let raw_labels = ix.labels.clone();
     let lab = source_oklab(source);
     let pal_lab = palette_oklab(&ix.palette);
     unmix(&mut ix, &lab, &pal_lab, unmix_radius(estimated_pitch(Some(&base))));
 
-    let grid = grid_at_scale(base, &profiles, config, config.grid_scale);
+    Ok(Some(BlocksPrep { unmixed: ix, raw_labels, profiles, base }))
+}
 
-    let winners = vote_cells(&ix, &grid);
-    paint_cells(&mut ix, &grid, &winners);
-    Ok(Cleaned { image: render(&ix), grid: Some(grid) })
+impl BlocksPrep<'_> {
+    /// One colour per cell of `grid`, painted at the original size.
+    ///
+    /// * Colour: the majority label among the cell's pixels with `alpha > 0`, counted
+    ///   after un-mixing; ties go to the label that appears first in the image.
+    /// * Alpha: every pixel keeps its own source alpha. Fully transparent pixels are
+    ///   copied from the source, so an opaque feature inside a mostly transparent cell
+    ///   keeps its shape and takes the cell's colour.
+    pub fn render(&self, grid: &Grid) -> RgbaImage {
+        let mut ix = IndexedImage {
+            source: self.unmixed.source,
+            palette: self.unmixed.palette.clone(),
+            labels: self.unmixed.labels.clone(),
+        };
+        let winners = vote_cells(&ix, grid);
+        paint_cells(&mut ix, grid, &winners);
+        render(&ix)
+    }
+}
+
+/// **Blocks** ("snap in place"): one colour per grid cell, painted back at the
+/// original size, on the grid that `config` asks for. See [`BlocksPrep::render`].
+pub fn blocks(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Result<Cleaned> {
+    let Some(prep) = prepare_blocks(source, quantized, config)? else {
+        return Ok(Cleaned { image: quantized.clone(), grid: None });
+    };
+    let grid = crate::candidates::requested_grid(&prep.base, &prep.profiles, source, config)?;
+    Ok(Cleaned { image: prep.render(&grid), grid: Some(grid) })
 }
 
 /// Majority label per cell (row-major over cells), [`TRANSPARENT`] for a cell with no

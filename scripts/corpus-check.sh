@@ -6,7 +6,7 @@
 #                                      read the diff before committing it)
 #
 # Also builds the WASM package and runs scripts/wasm-smoke.mjs when wasm-pack and node
-# are installed.
+# are installed, and the frontend's unit tests when node is.
 #
 # Each line is the CLI's --stats output for one image in one mode: output size, the
 # grid and how well it explains the source (residual), number of colours, and how many
@@ -31,6 +31,12 @@ run() { # run <image> <extra args...>
   "$BIN" "$image" "$OUT/out.png" 16 "$@" --stats | tail -n 1
 }
 
+ladder() { # ladder <image> <extra args...>
+  local image="$1"; shift
+  "$BIN" "$image" "$OUT/cand.png" 16 "$@" --candidates \
+    | grep '^{' | sed "s|^{|{\"input\":\"$(basename "$image")\",|"
+}
+
 {
   for image in other/*.png; do
     run "$image"
@@ -46,6 +52,11 @@ run() { # run <image> <extra args...>
     run "$image" --grid-fitter=dp
     run "$image" --grid-fitter=dp --grid-scale=2
     run "$image" --grid-fitter=dp --no-resize --cleanup=blocks
+    # The audition ladders: one line per candidate.
+    ladder "$image"
+    ladder "$image" --grid-fitter=dp
+    ladder "$image" --no-resize --cleanup=blocks
+    ladder "$image" --no-resize --cleanup=blocks --grid-fitter=dp
   done
 } > "$OUT/current.jsonl"
 
@@ -55,6 +66,14 @@ if command -v wasm-pack >/dev/null && command -v node >/dev/null; then
   node scripts/wasm-smoke.mjs
 else
   echo "Skipping the WASM smoke test (needs wasm-pack and node)."
+fi
+
+# The frontend's own logic (cache, selection, settings keys), which needs only node.
+if command -v node >/dev/null; then
+  (cd spritefusion-frontend && node --experimental-strip-types --test "tests/*.test.ts" 2>&1 \
+    | grep -E "^# (tests|pass|fail) " | tr '\n' ' ' && echo)
+  (cd spritefusion-frontend && node --experimental-strip-types --test "tests/*.test.ts" >/dev/null 2>&1) \
+    || { echo "Frontend tests FAILED: run 'npm test' in spritefusion-frontend." >&2; exit 1; }
 fi
 
 if [[ "${1:-}" == "--update" ]]; then

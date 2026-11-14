@@ -1,5 +1,5 @@
 import './style.css';
-import { initWasm, processImage } from './wasm';
+import { initWasm, processCandidates } from './wasm';
 import {
   bytesToObjectUrl,
   countUniqueColors,
@@ -8,7 +8,11 @@ import {
   getOutputFilename,
   revokeObjectUrl,
 } from './utils/image-helpers';
-import { createResultCache, type CachedResult } from './utils/result-cache';
+import {
+  createResultCache,
+  type CachedResult,
+  type ResultSet,
+} from './utils/result-cache';
 import {
   DEFAULT_SETTINGS,
   effectiveSettings,
@@ -19,6 +23,8 @@ import { createDropzone, validateFile } from './components/dropzone';
 import { createControls } from './components/controls';
 import { createComparison } from './components/comparison';
 import { createStats } from './components/stats';
+import { createCandidates } from './components/candidates';
+import { chooseSelection } from './selection';
 import { createToolbar } from './components/toolbar';
 
 // --- Toast ---
@@ -40,7 +46,9 @@ interface AppState {
   originalWidth: number;
   originalHeight: number;
   originalUniqueColors: number;
-  current: CachedResult | null;
+  /** The set of results on screen, and which of them is in the comparison view. */
+  current: ResultSet | null;
+  selected: number;
   /** What the controls currently say; hidden controls keep their value. */
   settings: ProcessSettings;
   isProcessing: boolean;
@@ -54,6 +62,7 @@ const state: AppState = {
   originalHeight: 0,
   originalUniqueColors: 0,
   current: null,
+  selected: 0,
   settings: { ...DEFAULT_SETTINGS },
   isProcessing: false,
 };
@@ -68,11 +77,15 @@ let fileSeq = 0;
 let requestSeq = 0;
 // Set when a debounced change lands mid-run; replayed once the run finishes.
 let pendingRun = false;
+// Set when the user submits a width; the next set shown selects that size, whether
+// it had to be computed or was already cached.
+let selectTypedWidth = false;
 
 // --- DOM refs ---
 const controlsEl = document.getElementById('controls')!;
 const comparisonEl = document.getElementById('comparison')!;
 const statsEl = document.getElementById('stats')!;
+const candidatesEl = document.getElementById('candidates')!;
 const toolbarEl = document.getElementById('toolbar')!;
 
 // --- Components ---
@@ -97,9 +110,6 @@ const controls = createControls(controlsEl, {
   onCleanupStrengthChange: (strength) => {
     state.settings.cleanupStrength = strength;
   },
-  onGridScaleChange: (gridScale) => {
-    state.settings.gridScale = gridScale;
-  },
   onGridFitterChange: (gridFitter) => {
     state.settings.gridFitter = gridFitter;
   },
@@ -108,8 +118,24 @@ const controls = createControls(controlsEl, {
 const comparison = createComparison(comparisonEl);
 const stats = createStats(statsEl);
 
+const candidates = createCandidates(candidatesEl, {
+  onSelect: (index) => {
+    if (!state.current || index === state.selected) return;
+    showResult(state.current, index);
+  },
+  onTargetWidth: (width) => {
+    state.settings.targetWidth = width;
+    selectTypedWidth = width > 0;
+    runProcess();
+  },
+});
+
+function selectedResult(): CachedResult | null {
+  return state.current?.results[state.selected] ?? null;
+}
+
 createToolbar(toolbarEl, {
-  getProcessedBytes: () => state.current?.bytes ?? null,
+  getProcessedBytes: () => selectedResult()?.bytes ?? null,
   getFilename: () => getOutputFilename(state.originalFile?.name ?? 'image.png'),
 });
 
@@ -143,8 +169,13 @@ async function handleFile(file: File) {
     if (state.current) renderStats();
   });
 
+  // A typed width belongs to the image it was typed for.
+  state.settings.targetWidth = 0;
+  selectTypedWidth = false;
+
   dropzone.collapse();
   controlsEl.classList.remove('hidden');
+  candidatesEl.classList.add('hidden');
   comparisonEl.classList.add('hidden');
   statsEl.classList.add('hidden');
   toolbarEl.classList.add('hidden');
@@ -153,39 +184,56 @@ async function handleFile(file: File) {
 }
 
 function renderStats() {
-  const entry = state.current;
-  if (!entry) return;
+  const set = state.current;
+  const result = selectedResult();
+  if (!set || !result) return;
   stats.update({
     originalWidth: state.originalWidth,
     originalHeight: state.originalHeight,
     originalUniqueColors: state.originalUniqueColors,
-    outputWidth: entry.width,
-    outputHeight: entry.height,
-    kColors: entry.settings.kColors,
-    outputUniqueColors: entry.uniqueColors,
-    noResize: entry.settings.noResize,
-    algorithm: entry.settings.algorithm,
-    cleanup: entry.settings.cleanup,
-    cleanupStrength: entry.settings.cleanupStrength,
-    gridScale: entry.settings.gridScale,
+    outputWidth: result.width,
+    outputHeight: result.height,
+    kColors: set.settings.kColors,
+    outputUniqueColors: result.uniqueColors,
+    noResize: set.settings.noResize,
+    algorithm: set.settings.algorithm,
+    cleanup: set.settings.cleanup,
+    cleanupStrength: set.settings.cleanupStrength,
+    gridCols: result.cols,
+    gridRows: result.rows,
   });
 }
 
-/** Show a result. Synchronous, so a cache hit swaps the preview instantly. */
-function applyResult(entry: CachedResult) {
-  state.current = entry;
-  resultCache.pin(entry.key);
+/** Put one result of a set in the comparison view. Synchronous: switching is instant. */
+function showResult(set: ResultSet, index: number) {
+  const sameSet = state.current === set;
+  state.current = set;
+  state.selected = index;
+  resultCache.pin(set.key);
 
+  const result = set.results[index];
   if (comparisonEl.classList.contains('hidden')) {
     comparisonEl.classList.remove('hidden');
-    comparison.setImages(state.originalUrl!, entry.url);
+    comparison.setImages(state.originalUrl!, result.url);
   } else {
-    comparison.updateProcessed(entry.url);
+    comparison.updateProcessed(result.url);
   }
 
+  if (sameSet) {
+    candidates.select(index);
+  } else {
+    candidates.update(set, index);
+  }
   renderStats();
   statsEl.classList.remove('hidden');
   toolbarEl.classList.remove('hidden');
+}
+
+/** Show a set of results, choosing which of them to display. */
+function applyResultSet(set: ResultSet) {
+  const index = chooseSelection(set, selectedResult(), selectTypedWidth);
+  selectTypedWidth = false;
+  showResult(set, index);
 }
 
 async function runProcess() {
@@ -198,7 +246,7 @@ async function runProcess() {
 
   const cached = resultCache.get(key);
   if (cached) {
-    applyResult(cached);
+    applyResultSet(cached);
     return;
   }
 
@@ -210,6 +258,7 @@ async function runProcess() {
   const token = fileSeq;
   state.isProcessing = true;
   controls.setProcessing(true);
+  candidates.setProcessing(true);
 
   // rAF + setTimeout trick to let the spinner render before blocking WASM call
   await new Promise<void>((resolve) =>
@@ -217,38 +266,51 @@ async function runProcess() {
   );
 
   try {
-    const bytes = await processImage(state.originalBytes, settings);
-    const url = bytesToObjectUrl(bytes);
+    const produced = await processCandidates(state.originalBytes, settings);
+    const results: CachedResult[] = produced.map((c) => ({
+      bytes: c.png,
+      url: bytesToObjectUrl(c.png),
+      width: c.width,
+      height: c.height,
+      // Counted by the engine: decoding five megapixel images to count their
+      // colours in JS cost more than producing them.
+      uniqueColors: c.uniqueColors,
+      cols: c.cols,
+      rows: c.rows,
+      gridScale: c.gridScale,
+      isLegacy: c.isLegacy,
+    }));
 
-    const [outDim, outputUniqueColors] = await Promise.all([
-      getImageDimensions(url),
-      countUniqueColors(url),
-    ]);
-
-    // A new image landed mid-run: this result belongs to the old one.
+    // A new image landed mid-run: these results belong to the old one.
     if (token !== fileSeq) {
-      revokeObjectUrl(url);
+      for (const r of results) revokeObjectUrl(r.url);
       return;
     }
 
-    const entry: CachedResult = {
+    const set: ResultSet = {
       key,
-      bytes,
-      url,
-      width: outDim.width,
-      height: outDim.height,
-      uniqueColors: outputUniqueColors,
       settings,
+      results,
+      latticeScore: produced[0]?.latticeScore ?? 0,
     };
-    resultCache.set(entry);
-
-    // Only paint if nothing newer has been requested in the meantime.
-    if (seq === requestSeq) applyResult(entry);
+    // Only paint if nothing newer has been requested in the meantime. A set that is
+    // about to be painted is pinned as it is stored, so that making room for it
+    // cannot evict it.
+    const willShow = seq === requestSeq;
+    resultCache.set(set, { pin: willShow });
+    if (willShow) applyResultSet(set);
   } catch (err) {
     showToast(`Processing failed: ${err}`);
+    // A typed width the engine refused must not stick and fail every later run. Go
+    // back to the width of the set still on screen, so its sizes stay as they are.
+    if (state.settings.targetWidth === settings.targetWidth) {
+      state.settings.targetWidth = state.current?.settings.targetWidth ?? 0;
+    }
+    selectTypedWidth = false;
   } finally {
     state.isProcessing = false;
     controls.setProcessing(false);
+    candidates.setProcessing(false);
     if (pendingRun) {
       pendingRun = false;
       runProcess();

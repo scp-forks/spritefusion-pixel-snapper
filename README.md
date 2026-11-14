@@ -97,6 +97,8 @@ Optional flags after the color count:
 | `--strength=light\|medium\|strong` | For `--cleanup=smooth`: remove regions under 4, 8 or 16 px (more on coarse grids). Default `light` |
 | `--grid-scale=<1-16>` | Work on a grid this many times finer than the detected one. Use 1.5, 2 or 3 when details are being lost. Applies to the snapped output and to `--cleanup=blocks`. Cells are never smaller than 2 px |
 | `--grid-fitter=walk\|dp` | How the pixel grid is found. `walk` is the original and the default. `dp` fits the grid to edges in the source image with a globally optimal elastic fit: it handles perfectly crisp (nearest-neighbor upscaled) pixel art, which `walk` cannot measure, and places cell borders more exactly. Experimental; it changes the snapped output |
+| `--target-width=<cells>` | Ask for a grid about this many cells wide, instead of `--grid-scale`. On an image with a pixel grid the result follows the grid and may land a few cells off; on one without, the width is exact |
+| `--candidates` | Write several sizes instead of one: the detected grid and finer ones (and `--target-width` if given), as `output.<cols>x<rows>.png`, with one JSON line each. No measurable property of an image picks the right size, so the tool offers a ladder and you choose. Works for the snapped output and for `--cleanup=blocks` |
 | `--stats` | Print one JSON line describing the output: size, grid, color count, and how many same-color regions are under 4 px and under 16 px |
 
 ```bash
@@ -145,6 +147,31 @@ try {
 ```
 
 Invalid options throw; nothing is silently clamped.
+
+To let a user choose among sizes, ask for all of them at once. The image is quantized once and each further size is cheap:
+
+```js
+import init, { ProcessOptions, process_candidates } from './pkg/spritefusion_pixel_snapper.js';
+
+const opts = new ProcessOptions();   // snap mode; or no_resize + cleanup = 1 for full-size blocks
+opts.target_width = 128;             // optional: add a size of your own
+const results = process_candidates(inputBytes, opts).map((c) => {
+  const r = {                        // every getter copies out of WASM memory: read once
+    png: c.png, width: c.width, height: c.height,
+    uniqueColors: c.unique_colors,
+    cols: c.cols, rows: c.rows,      // the grid; 0 for modes without one
+    gridScale: c.grid_scale,         // 1 = the detected grid
+    latticeScore: c.lattice_score,   // >= 0.20 clear pixel grid, < 0.07 none found
+    isLegacy: c.is_legacy,           // exactly what process_image returns
+    colCuts: c.col_cuts, rowCuts: c.row_cuts,
+  };
+  c.free();
+  return r;
+});
+opts.free();
+```
+
+Results come coarsest first. `grid_scale` is ignored by `process_candidates`.
 
 ## Acknowledgments
 

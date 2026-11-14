@@ -1,4 +1,4 @@
-/** Everything that determines a processing result. */
+/** Everything that determines a set of results. */
 export interface ProcessSettings {
   kColors: number;
   /** Keep the original dimensions instead of snapping to one pixel per cell. */
@@ -9,13 +9,16 @@ export interface ProcessSettings {
   cleanup: number;
   /** How much Smooth may remove: 1 light, 2 medium, 3 strong. Only used by Smooth. */
   cleanupStrength: number;
-  /** How many times finer than the detected grid to work. Only used by Blocks. */
-  gridScale: number;
   /**
    * How the pixel grid is found: 0 the original walker, 1 the elastic fit on the
    * source image. Used wherever a grid is: snap mode, Blocks, and Smooth's scale.
    */
   gridFitter: number;
+  /**
+   * A grid width the user typed, added to the sizes on offer; 0 = none. Only used
+   * where sizes are offered: snap mode and Blocks.
+   */
+  targetWidth: number;
 }
 
 export const CLEANUP_OFF = 0;
@@ -24,9 +27,9 @@ export const CLEANUP_SMOOTH = 2;
 
 export const CLEANUP_NAMES = ['Off', 'Blocks', 'Smooth'];
 export const STRENGTH_LIGHT = 1;
+export const STRENGTH_NAMES = ['', 'light', 'medium', 'strong'];
 export const FITTER_WALK = 0;
 export const FITTER_NAMES = ['Standard', 'Elastic'];
-export const STRENGTH_NAMES = ['', 'light', 'medium', 'strong'];
 
 export const DEFAULT_SETTINGS: ProcessSettings = {
   kColors: 16,
@@ -34,9 +37,14 @@ export const DEFAULT_SETTINGS: ProcessSettings = {
   algorithm: 0,
   cleanup: CLEANUP_OFF,
   cleanupStrength: STRENGTH_LIGHT,
-  gridScale: 1,
   gridFitter: FITTER_WALK,
+  targetWidth: 0,
 };
+
+/** Modes that produce several sizes to choose from. */
+export function offersSizes(s: ProcessSettings): boolean {
+  return !s.noResize || s.cleanup === CLEANUP_BLOCKS;
+}
 
 /**
  * The settings as the engine will actually use them. Controls that are hidden in the
@@ -50,22 +58,26 @@ export function effectiveSettings(s: ProcessSettings): ProcessSettings {
       algorithm: 0,
       cleanup: CLEANUP_OFF,
       cleanupStrength: STRENGTH_LIGHT,
-      gridScale: 1,
     };
   }
   return {
     ...s,
     cleanupStrength: s.cleanup === CLEANUP_SMOOTH ? s.cleanupStrength : STRENGTH_LIGHT,
-    gridScale: s.cleanup === CLEANUP_BLOCKS ? s.gridScale : 1,
     // Plain palette reduction uses no grid at all.
     gridFitter: s.cleanup === CLEANUP_OFF ? FITTER_WALK : s.gridFitter,
+    targetWidth: s.cleanup === CLEANUP_BLOCKS ? s.targetWidth : 0,
   };
 }
 
-/** Cache identity of a result: equal keys mean byte-identical output. */
+/** Cache identity of a set of results: equal keys mean byte-identical output. */
 export function settingsKey(s: ProcessSettings): string {
   const e = effectiveSettings(s);
   return e.noResize
-    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridScale}:${e.gridFitter}`
-    : `snap:${e.kColors}:${e.gridFitter}`;
+    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridFitter}:${e.targetWidth}`
+    : `snap:${e.kColors}:${e.gridFitter}:${e.targetWidth}`;
 }
+
+/** Lattice score at or above which the image clearly has a pixel grid. */
+export const CLEAR_LATTICE_SCORE = 0.2;
+/** Lattice score below which no pixel grid was found. */
+export const NO_LATTICE_SCORE = 0.07;

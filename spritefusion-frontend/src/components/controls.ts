@@ -1,4 +1,4 @@
-import { CLEANUP_BLOCKS, CLEANUP_OFF, CLEANUP_SMOOTH } from '../settings';
+import { CLEANUP_OFF, CLEANUP_SMOOTH } from '../settings';
 
 export interface ControlsCallbacks {
   onProcess: () => void;
@@ -7,7 +7,6 @@ export interface ControlsCallbacks {
   onAlgorithmChange: (algorithm: number) => void;
   onCleanupChange: (cleanup: number) => void;
   onCleanupStrengthChange: (strength: number) => void;
-  onGridScaleChange: (gridScale: number) => void;
   onGridFitterChange: (gridFitter: number) => void;
 }
 
@@ -36,7 +35,7 @@ export function createControls(
         <option value="5">Differentiable Palette</option>
       </select>
       <select class="controls-select controls-cleanup hidden"
-        title="Cleanup removes the speckle that palette reduction leaves. Blocks gives every grid cell one colour, at the original size. Smooth keeps soft shading: it resolves blended edges and merges tiny regions into their most similar neighbour. Both flatten intentional dithering; use Off to keep it.">
+        title="Cleanup removes the speckle that palette reduction leaves. Blocks gives every grid cell one colour, at the original size, and offers several grid sizes to choose from. Smooth keeps soft shading: it resolves blended edges and merges tiny regions into their most similar neighbour. Both flatten intentional dithering; use Off to keep it.">
         <option value="0">Cleanup: Off</option>
         <option value="1">Cleanup: Blocks</option>
         <option value="2">Cleanup: Smooth</option>
@@ -46,13 +45,6 @@ export function createControls(
         <option value="1">Strength: Light</option>
         <option value="2">Strength: Medium</option>
         <option value="3">Strength: Strong</option>
-      </select>
-      <select class="controls-select controls-grid-scale hidden"
-        title="Blocks works on the detected pixel grid. Choose a finer grid if details are being lost.">
-        <option value="1">Grid: Auto</option>
-        <option value="1.5">Grid: 1.5x finer</option>
-        <option value="2">Grid: 2x finer</option>
-        <option value="3">Grid: 3x finer</option>
       </select>
       <select class="controls-select controls-grid-fitter"
         title="How the pixel grid is found. Standard is the original method. Elastic fits the grid to edges in the source image: it handles perfectly crisp pixel art, which Standard cannot measure, and places cell borders more exactly. It changes the result, so it is opt-in.">
@@ -71,7 +63,6 @@ export function createControls(
   const checkbox = container.querySelector<HTMLInputElement>('.controls-checkbox')!;
   const algorithmSelect = container.querySelector<HTMLSelectElement>('.controls-algorithm')!;
   const cleanupSelect = container.querySelector<HTMLSelectElement>('.controls-cleanup')!;
-  const gridScaleSelect = container.querySelector<HTMLSelectElement>('.controls-grid-scale')!;
   const strengthSelect = container.querySelector<HTMLSelectElement>('.controls-strength')!;
   const gridFitterSelect = container.querySelector<HTMLSelectElement>('.controls-grid-fitter')!;
 
@@ -81,7 +72,6 @@ export function createControls(
     const cleanup = parseInt(cleanupSelect.value, 10);
     algorithmSelect.classList.toggle('hidden', !noResize);
     cleanupSelect.classList.toggle('hidden', !noResize);
-    gridScaleSelect.classList.toggle('hidden', !(noResize && cleanup === CLEANUP_BLOCKS));
     strengthSelect.classList.toggle('hidden', !(noResize && cleanup === CLEANUP_SMOOTH));
     // Plain palette reduction is the one mode that uses no grid.
     gridFitterSelect.classList.toggle('hidden', noResize && cleanup === CLEANUP_OFF);
@@ -148,10 +138,6 @@ export function createControls(
     scheduleProcess();
   });
 
-  gridScaleSelect.addEventListener('change', () => {
-    callbacks.onGridScaleChange(parseFloat(gridScaleSelect.value));
-    scheduleProcess();
-  });
 
   algorithmSelect.addEventListener('change', () => {
     callbacks.onAlgorithmChange(parseInt(algorithmSelect.value, 10));
@@ -170,7 +156,6 @@ export function createControls(
       checkbox.disabled = processing;
       algorithmSelect.disabled = processing;
       cleanupSelect.disabled = processing;
-      gridScaleSelect.disabled = processing;
       strengthSelect.disabled = processing;
       gridFitterSelect.disabled = processing;
       btnText.textContent = processing ? 'Processing...' : 'Process';

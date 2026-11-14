@@ -221,40 +221,157 @@ fn dp_fit_both_axes(
     (best.1, best.2, best.3)
 }
 
-/// How well `grid` explains `source`: the mean OKLab distance of every opaque pixel
-/// from the mean colour of its cell. 0 means every cell is one flat colour.
-pub fn residual(source: &RgbaImage, grid: &Grid) -> f64 {
-    let w = source.width() as usize;
-    let lab: Vec<Option<[f32; 3]>> = source
-        .pixels()
-        .map(|p| (p[3] != 0).then(|| srgb_to_oklab(p[0], p[1], p[2])))
-        .collect();
-    let (mut total, mut count) = (0.0f64, 0u64);
-    for row in grid.rows.windows(2) {
-        for col in grid.cols.windows(2) {
-            let (mut sum, mut n) = ([0.0f64; 3], 0u64);
-            for y in row[0]..row[1] {
-                for p in lab[y * w + col[0]..y * w + col[1]].iter().flatten() {
-                    for ch in 0..3 {
-                        sum[ch] += p[ch] as f64;
-                    }
-                    n += 1;
-                }
-            }
-            if n == 0 {
-                continue;
-            }
-            let mean = [sum[0] / n as f64, sum[1] / n as f64, sum[2] / n as f64];
-            for y in row[0]..row[1] {
-                for p in lab[y * w + col[0]..y * w + col[1]].iter().flatten() {
-                    let d: f64 = (0..3).map(|ch| (p[ch] as f64 - mean[ch]).powi(2)).sum();
-                    total += d.sqrt();
-                }
-            }
-            count += n;
+/// A source image in OKLab, converted once. `None` marks fully transparent pixels.
+pub struct LabImage {
+    w: usize,
+    h: usize,
+    lab: Vec<Option<[f32; 3]>>,
+}
+
+impl LabImage {
+    pub fn new(source: &RgbaImage) -> LabImage {
+        LabImage {
+            w: source.width() as usize,
+            h: source.height() as usize,
+            lab: source
+                .pixels()
+                .map(|p| (p[3] != 0).then(|| srgb_to_oklab(p[0], p[1], p[2])))
+                .collect(),
         }
     }
-    if count == 0 { 0.0 } else { total / count as f64 }
+
+    /// How well `grid` explains the image: the mean OKLab distance of every opaque
+    /// pixel from the mean colour of its cell. 0 means every cell is one flat colour.
+    pub fn residual(&self, grid: &Grid) -> f64 {
+        let w = self.w;
+        let (mut total, mut count) = (0.0f64, 0u64);
+        for row in grid.rows.windows(2) {
+            for col in grid.cols.windows(2) {
+                let (mut sum, mut n) = ([0.0f64; 3], 0u64);
+                for y in row[0]..row[1] {
+                    for p in self.lab[y * w + col[0]..y * w + col[1]].iter().flatten() {
+                        for ch in 0..3 {
+                            sum[ch] += p[ch] as f64;
+                        }
+                        n += 1;
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                let mean = [sum[0] / n as f64, sum[1] / n as f64, sum[2] / n as f64];
+                for y in row[0]..row[1] {
+                    for p in self.lab[y * w + col[0]..y * w + col[1]].iter().flatten() {
+                        let d: f64 = (0..3).map(|ch| (p[ch] as f64 - mean[ch]).powi(2)).sum();
+                        total += d.sqrt();
+                    }
+                }
+                count += n;
+            }
+        }
+        if count == 0 { 0.0 } else { total / count as f64 }
+    }
+
+    /// **Lattice score**: is there a pixel grid here, and has `grid` found it?
+    ///
+    /// `1 - residual(grid) / r`, where `r` is the geometric mean of the residuals of two
+    /// even grids that cannot be aligned with a lattice at this pitch: one with cells
+    /// 0.8 times as large and one 1.25 times. A fitted grid on real pixel art explains
+    /// the image far better than either (0.4 to 0.5 on clean art); on an image with no
+    /// lattice all three do about the same (0.0 to 0.1). Defined as 0 when the unaligned
+    /// grids already explain the image perfectly.
+    ///
+    /// Comparing against an even grid of the *same* cell count would not do: a perfectly
+    /// regular lattice is matched by exactly that grid and would score 0.
+    pub fn lattice_score(&self, grid: &Grid) -> f32 {
+        let (cols, rows) = ((grid.cols.len() - 1) as f64, (grid.rows.len() - 1) as f64);
+        let unaligned = |factor: f64| {
+            let even = even_grid(
+                self.w,
+                self.h,
+                ((cols / factor).round() as usize).clamp(1, self.w),
+                ((rows / factor).round() as usize).clamp(1, self.h),
+            );
+            self.residual(&even)
+        };
+        let reference = (unaligned(0.8) * unaligned(1.25)).sqrt();
+        if !(reference > 0.0) {
+            return 0.0;
+        }
+        (1.0 - self.residual(grid) / reference) as f32
+    }
+}
+
+/// [`LabImage::residual`] for a one-off measurement.
+#[cfg(test)]
+pub fn residual(source: &RgbaImage, grid: &Grid) -> f64 {
+    LabImage::new(source).residual(grid)
+}
+
+/// A grid of `cols` x `rows` equal cells (to the nearest pixel), fitted to nothing.
+pub fn even_grid(width: usize, height: usize, cols: usize, rows: usize) -> Grid {
+    let cuts = |limit: usize, cells: usize| -> Vec<usize> {
+        let cells = cells.clamp(1, limit.max(1));
+        let mut out: Vec<usize> =
+            (0..=cells).map(|i| (i as f64 * limit as f64 / cells as f64).round() as usize).collect();
+        out.dedup();
+        out
+    };
+    Grid {
+        cols: cuts(width, cols),
+        rows: cuts(height, rows),
+        step: (width as f64 / cols.max(1) as f64, height as f64 / rows.max(1) as f64),
+        step_estimated: false,
+    }
+}
+
+/// A grid of about `target_cols` columns for a size the user typed, on an image that
+/// has a lattice. Rows follow in proportion. No cell is under [`MIN_CELL_PX`].
+///
+/// * `Dp` re-fits at the pitch that gives that width, so the cuts land on whatever
+///   edges exist at that scale and the width comes out within a few cells.
+/// * `Walk` cannot do that: at a pitch the image has no edges for, the greedy walker
+///   and the legacy uniform snapper both drift badly (61 and 35 columns when asked for
+///   48 on a clean 24-cell lattice). The detected grid is re-divided instead: the new
+///   cuts are evenly spaced in *cell* coordinates and so inherit its stretch. Doubling
+///   is then exactly a subdivision.
+pub fn grid_for_cols(
+    base: &Grid,
+    profiles: &Profiles,
+    target_cols: usize,
+    width: u32,
+    height: u32,
+) -> Grid {
+    let pitch = width as f64 / target_cols.max(1) as f64;
+    let (cols, rows) = match profiles.fitter {
+        GridFitter::Walk => {
+            let ratio = target_cols as f64 / (base.cols.len() - 1) as f64;
+            let target_rows = (((base.rows.len() - 1) as f64 * ratio).round() as usize).max(1);
+            (redivide(&base.cols, target_cols), redivide(&base.rows, target_rows))
+        }
+        GridFitter::Dp => (
+            dp_cuts(&profiles.x, pitch.max(MIN_CELL_PX as f64), width as usize),
+            dp_cuts(&profiles.y, pitch.max(MIN_CELL_PX as f64), height as usize),
+        ),
+    };
+    Grid { cols, rows, step: (pitch, pitch), step_estimated: base.step_estimated }
+}
+
+/// `cells` cuts-to-cuts intervals spread evenly over the cells of `cuts`, each new cut
+/// placed proportionally inside the old cell it falls in.
+fn redivide(cuts: &[usize], cells: usize) -> Vec<usize> {
+    let old = cuts.len() - 1;
+    let cells = cells.max(1);
+    let mut out: Vec<usize> = (0..=cells)
+        .map(|k| {
+            let pos = k as f64 * old as f64 / cells as f64;
+            let i = (pos.floor() as usize).min(old - 1);
+            let frac = pos - i as f64;
+            (cuts[i] as f64 + frac * (cuts[i + 1] - cuts[i]) as f64).round() as usize
+        })
+        .collect();
+    out.dedup();
+    merge_narrow_intervals(out)
 }
 
 /// Split every interval into `factor` equal parts, or into as many as fit without

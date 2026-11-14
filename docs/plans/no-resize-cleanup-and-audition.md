@@ -609,3 +609,97 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
   default cannot measure crisp pixel art (68×70 instead of 205×208). DP fixes that and
   is opt-in. Making it the default would change every existing output.
 
+### Phase 5 — done
+
+- `src/candidates.rs`: `build` (every candidate for an image), `ladder`,
+  `grid_for_width`, `requested_grid`, `lattice_label`. `grid.rs`: `LabImage` with
+  `residual` and `lattice_score`, `even_grid`, `grid_for_cols`. `cleanup.rs`:
+  `prepare_blocks` / `BlocksPrep::render`, so Blocks quantizes and un-mixes once and
+  renders on any number of grids. WASM `process_candidates` returning `Candidate`s;
+  `ProcessOptions.target_width`. CLI `--candidates`, `--target-width=`; `--stats` gained
+  `lattice_score`.
+- Frontend: a "Sizes" strip of thumbnails under the controls in snap mode and Blocks,
+  with the lattice verdict and an "Add width" box; clicking a size puts it in the
+  comparison view and the download. The Grid select from Phase 2 is gone (the strip
+  replaces it). The cache now holds sets of results and pins the whole set on screen.
+  Changing colours, algorithm or grid fit keeps the size the user was looking at (the
+  nearest within a tenth).
+- **The ladders** (first task of the phase), 16 colours. `*` marks the legacy result.
+
+  Snap mode:
+
+  | image | Walk | DP | lattice score, Walk / DP |
+  |---|---|---|---|
+  | wolf | *205×208, 283×290, 392×380, 461×461 | 206×203, 309×304, 412×406, 449×451 | 0.12 / 0.18 weak |
+  | coliseum | *188×100, 301×178, 374×198, 561×297 | 183×99, 286×166, 366×198, 549×297 | 0.30 / 0.37 clear |
+  | ogtrail | *181×103, 252×143, 337×191, 427×246 | 196×112, 288×166, 392×224, 425×233 | 0.03 none / 0.08 weak |
+  | city | *111×120, 171×158, 196×203, 229×228 | 100×95, 147×143, 200×190, 228×230 | 0.05 / 0.04 none |
+  | sprite sheet | *169×169, 260×263, 338×337, 428×426 | 256×256, 447×441, 509×511 | 0.04 none / 0.52 clear |
+  | cat | *228×219, 330×319, 390×388, 445×452 | 256×256, 345×343, 512×511 | 0.01 / 0.01 none |
+
+  Blocks (full-size output; grid shown):
+
+  | image | Walk | DP |
+  |---|---|---|
+  | wolf | 187×187, 255×271, 363×352, 472×462 | 206×203, 309×304, 412×406, 449×451 |
+  | coliseum | 187×99, 306×180, 374×198, 561×297 | 183×99, 286×166, 366×198, 549×297 |
+  | ogtrail | 200×116, 278×156, 362×211, 438×238 | 196×112, 288×166, 392×224, 425×233 |
+  | city | 109×119, 168×154, 196×202, 231×229 | 100×95, 147×143, 200×190, 228×230 |
+  | sprite sheet | 251×253, 452×464 | 256×256, 447×441, 509×511 |
+  | cat | 228×223, 335×321, 382×391, 441×454 | 256×256, 345×343, 512×511 |
+
+  The "×3" rung is rarely three times as wide: a 5 px cell can only be halved.
+- "Done when": met. ogtrail offers four sizes, the finest 2.36× the estimate's width,
+  and the lettering reads "Oregon Trail Mix" in the three finest (252, 337, 427 wide);
+  at the estimate (181) it reads "Dragon Trail Mr".
+- **The lattice score depends on the grid as well as the image.** It is high only when
+  the fitted grid has found the lattice. With the legacy fitter the sprite sheet scores
+  0.04, "none", because the grid it found (169×169) is wrong; with DP it scores 0.52.
+  The wolf scores 0.12 to 0.18, "weak", lower than the research's 0.24, which was
+  measured on a different grid. The labels (clear from 0.20, none under 0.07) are
+  provisional and the wolf shows the upper one may be too strict.
+- **Timing** (plan: measure before deciding on a Worker or a session object). Longest
+  main-thread task in Chromium on this machine, in milliseconds:
+
+  | action | wolf, 1.05 MP | coliseum, 1.57 MP |
+  |---|---|---|
+  | snap mode, first strip | 664 | 1 010 |
+  | snap mode, type a width | 689 | 1 035 |
+  | snap mode, switch to the elastic fitter | 842 | 1 273 |
+  | Blocks, first strip (4–5 full-size images) | 1 273 | 1 915 |
+  | Blocks, type a width | 1 184 | 1 906 |
+  | Smooth | 978 | 1 545 |
+
+  Natively a whole ladder takes 0.5 to 0.9 s. At 1 MP nothing exceeds the plan's 1.5 s,
+  so by the plan's own rule no Worker was built. At 1.6 MP Blocks does (1.9 s). Typing a
+  width costs a full run, because the image is re-quantized each time; a session object
+  holding the quantized image would make it nearly free. Neither was built: the plan
+  said not to build them speculatively, and this is the owner's decision 3.
+- Deviations from the plan:
+  - *One lattice score per image*, measured on the detected grid and repeated on every
+    candidate, not one per candidate. It is a statement about the image; per-rung
+    values would cost three more passes each and mean little.
+  - *Typed widths under the legacy fitter re-divide the detected grid* instead of
+    re-fitting. Both of the legacy code's own ways of fitting at a given pitch drift
+    badly at a pitch the image has no edges for (61 and 35 columns when asked for 48 on
+    a clean 24-cell lattice). DP re-fits, as planned.
+  - *Deduplication of typed widths.* Where no pixel grid was found the typed width is
+    exact and is always offered (unless it is an existing rung cut for cut). Where one
+    was found, a rung within a twentieth of the typed width is treated as the answer and
+    no second, near-identical rung is added.
+  - *A typed width is refused, not clamped,* when it would need cells under 2 px.
+  - `target_width` also works in the single-result calls, where it takes the place of
+    `grid_scale`.
+  - `Candidate` carries `width`, `height` and `unique_colors` in addition to the planned
+    fields, so the frontend no longer decodes every result to count its colours.
+  - The candidates follow the selected fitter. With DP selected there is no legacy
+    candidate in the strip; switching the Grid fit select back gives it.
+  - `process_candidates` is used for every mode; modes without a grid return one result
+    and the strip hides itself.
+- The frontend gained unit tests (`spritefusion-frontend/tests`, `npm test`, 14 tests on
+  Node's built-in runner): the result cache, the selection rule, and the settings keys.
+  `scripts/corpus-check.sh` runs them.
+- Codex review (`docs/reviews/phase-5-review.md`): four findings, all fixed. The two
+  that mattered: a typed width could vanish from the strip when it was close to another
+  size, and a large set arriving could be evicted from the cache before it was shown.
+

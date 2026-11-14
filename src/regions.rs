@@ -72,6 +72,44 @@ pub fn connected_components(labels: &[u32], w: usize, h: usize) -> Components {
     Components { id, area }
 }
 
+/// Distinct RGB values among pixels with `alpha > 0`.
+///
+/// Results of this tool have at most a few dozen colours and long runs of each, so a
+/// short list checked last-hit-first beats hashing every pixel; images with thousands
+/// of colours fall back to a set.
+pub fn count_unique_colors(img: &RgbaImage) -> usize {
+    const LIST_LIMIT: usize = 256;
+    let mut list: Vec<[u8; 3]> = Vec::new();
+    let mut last: Option<[u8; 3]> = None;
+    let mut pixels = img.pixels();
+    for p in pixels.by_ref() {
+        if p[3] == 0 {
+            continue;
+        }
+        let rgb = [p[0], p[1], p[2]];
+        if last == Some(rgb) {
+            continue;
+        }
+        last = Some(rgb);
+        if !list.contains(&rgb) {
+            list.push(rgb);
+            if list.len() > LIST_LIMIT {
+                break;
+            }
+        }
+    }
+    if list.len() <= LIST_LIMIT {
+        return list.len();
+    }
+    let mut set: std::collections::HashSet<[u8; 3]> = list.into_iter().collect();
+    for p in pixels {
+        if p[3] != 0 {
+            set.insert([p[0], p[1], p[2]]);
+        }
+    }
+    set.len()
+}
+
 /// Speckle statistics of a finished image.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageStats {
@@ -148,6 +186,25 @@ mod tests {
         let c = connected_components(&labels, 3, 1);
         assert_eq!(c.area, vec![1, 1]);
         assert_eq!(c.id[1], NO_LABEL);
+    }
+
+    #[test]
+    fn unique_colours_are_counted_the_same_on_both_paths() {
+        // Few colours: the list path. Transparent pixels and their hidden RGB do not count.
+        let mut img = RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255]));
+        img.put_pixel(0, 0, Rgba([9, 9, 9, 255]));
+        img.put_pixel(7, 7, Rgba([9, 9, 9, 128]));
+        img.put_pixel(3, 3, Rgba([50, 60, 70, 0]));
+        assert_eq!(count_unique_colors(&img), 2);
+        assert_eq!(count_unique_colors(&RgbaImage::from_pixel(4, 4, Rgba([5, 5, 5, 0]))), 0);
+
+        // Many colours: the set path, crossing the list limit mid-image, with repeats.
+        let mut big = RgbaImage::new(64, 64);
+        for (x, y, p) in big.enumerate_pixels_mut() {
+            *p = Rgba([(x * 4) as u8, (y % 20) as u8, 0, 255]);
+        }
+        assert_eq!(count_unique_colors(&big), 64 * 20);
+        assert_eq!(image_stats(&big).unique_colors, 64 * 20);
     }
 
     #[test]
