@@ -1,6 +1,6 @@
 # Plan: speckle cleanup and size audition
 
-Status: draft v2, not started. Revised after a review by Codex (gpt-6.1-sol, xhigh):
+Status: in progress on branch `feature/cleanup-and-audition`. See "Progress" at the end. Revised after a review by Codex (gpt-6.1-sol, xhigh):
 `docs/reviews/no-resize-cleanup-and-audition-review.md`. All nine findings were accepted.
 
 Evidence for the choices here is in `docs/research/` (`03-synthesis-and-recommendations.md`,
@@ -70,7 +70,7 @@ No behaviour change except the two fixes.
 | 0a | `spatial_quantize`: the output loop (`main.rs:1368`) recomputes the nearest palette colour per pixel and ignores the optimised `assignments`. Inside the loop, after the existing `alpha == 0` early-continue, use `assignments[coord_to_idx[y * ww + x].unwrap()]` | An image with transparent pixels scattered between opaque ones of distinctive colours: every opaque output pixel equals `palette[assignments[...]]`, transparent pixels are untouched. Plus: on a blurred synthetic lattice, algorithm 3 leaves fewer small regions than algorithm 0 **and** a marked 2×2 feature survives |
 | 0b | `gwo_quantize` returns 5 colours for k = 16 on `colliseum.png`. Find out why (suspects: `repair_wolf_palette`, `dedup_palette_oklab`, sample truncation in `build_weighted_samples`). Time-box to half a day; if not found, document and move on | An image with 16 well-separated colour clusters yields ≥ 14 output colours |
 | 0c | Golden test for the legacy snap path: output checksums for small committed fixtures under `tests/fixtures/` (crops of `wolf.png`, `colliseum.png`, `ogtrail.png`, ~128 px, one with transparency added) | Guards every later phase against changing shipping snap output |
-| 0d | CLI `--stats`: one JSON line with output size, unique colours, 4-connected regions under 4 px and under 16 px, lattice score | Lets a shell loop over `other/*.png` track regressions without Python |
+| 0d | CLI `--stats`: one JSON line with output size, unique colours, 4-connected regions under 4 px and under 16 px. (The lattice score joins it in Phase 5, where the score is implemented.) | Lets a shell loop over `other/*.png` track regressions without Python |
 | 0e | `scripts/corpus-check.sh`: run `--stats` over the six images in `other/` for the modes that exist so far and diff against a committed baseline file | The small corpus check, brought forward from Phase 7 |
 | 0f | `CLAUDE.md` port note 5173 → 5170 | — |
 
@@ -374,3 +374,35 @@ Phases 2, 3 and 4 are independent of each other. 2 → 5 is the path to the audi
 | The estimate is wrong (ogtrail: 2.6× too coarse) | The ladder always includes finer rungs and a typed width |
 | Blocks on an image with no grid produces an arbitrary mosaic | The lattice-score label says so; Smooth is the suggested mode there |
 | Main-thread stalls with several candidates | Measure in Phase 5; Worker or session only if the numbers call for it |
+
+## Progress
+
+Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Reviews are in
+`docs/reviews/`.
+
+### Phase 0 — done
+
+- **0a Spatial**: fixed as planned. Regions under 16 px at 16 colours, plain k-means
+  against fixed Spatial: coliseum 17 045 / 329, wolf 26 399 / 1 955, ogtrail 9 963 / 815,
+  city 34 565 / 2 386.
+- **0b Grey Wolf**: root cause found. The fitness added `0.001 / min_pair_distance²` to
+  an MSE of about 10⁻⁴–10⁻³, so the penalty was hundreds of times the error and the
+  search optimised for spreading centroids apart; most ended outside the image's colours
+  and owned no pixels. Three changes: the penalty is now relative to the MSE and only
+  active below a just-visible distance; the best palette ever seen is kept (every wolf,
+  leaders included, moves each iteration); centroids that own no pixel are re-seeded
+  before the final refinement. Colours used at k = 16: coliseum 5 → 16, ogtrail 7 → 16,
+  wolf 10 → 16, city → 16.
+- **0c Golden tests**: four fixtures in `tests/fixtures/`, hashes recorded from a build
+  of commit 07639e1 and cross-checked against the working tree.
+- **0d `--stats`**, **0e `scripts/corpus-check.sh`** with a 42-line baseline (six images
+  × snap and six no-resize algorithms), **0f** port note.
+- New tests were mutation-checked: with either bug put back, the corresponding test fails.
+- Codex review (`docs/reviews/phase-0-review.md`): five findings, all fixed. The two that
+  mattered: re-seeding could empty a cluster it had already passed, and
+  `build_weighted_samples` returned its bins in `HashMap` order, which made Grey Wolf and
+  the differentiable quantizer vary in the last float bit between runs (older than this
+  phase; now sorted). Golden tests also assert the PNG bytes, not only the pixels.
+- Noticed, not acted on: shipping snap gives 169×169 on the sprite sheet, whose true
+  grid is 256×256 (pitch 4). Another wrong estimate for the ladder to mitigate.
+

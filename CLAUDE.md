@@ -1,1 +1,1 @@
-**Dev Server Note**: The Vite dev server runs on port 5173. Take advantage of it if it's already running (check with `lsof`).
+**Dev Server Note**: The Vite dev server runs on port 5170. Take advantage of it if it's already running (check with `lsof`).

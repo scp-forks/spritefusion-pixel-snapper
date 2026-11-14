@@ -13,6 +13,8 @@ use std::fmt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod regions;
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuantAlgorithm {
@@ -60,6 +62,9 @@ pub struct Config {
     max_step_ratio: f64,
     no_resize: bool,
     algorithm: QuantAlgorithm,
+    /// CLI only: print one JSON line of output statistics after saving.
+    #[allow(dead_code)]
+    print_stats: bool,
 }
 
 impl Default for Config {
@@ -80,6 +85,7 @@ impl Default for Config {
             max_step_ratio: 1.8, // Lowered from 3.0 to catch more skew cases
             no_resize: false,
             algorithm: QuantAlgorithm::KMeansPerceptual,
+            print_stats: false,
         }
     }
 }
@@ -318,12 +324,14 @@ fn parse_args() -> Option<Config> {
         }
     }
 
-    // Optional flags: --no-resize, --algorithm=<0-5>
+    // Optional flags: --no-resize, --algorithm=<0-5>, --stats
     // Algorithm IDs: 0=K-Means Perceptual, 1=Median Cut, 2=Wu's Optimal,
     //                3=Spatial, 4=Grey Wolf, 5=Differentiable Palette
     for arg in args.iter().skip(3) {
         if arg == "--no-resize" {
             config.no_resize = true;
+        } else if arg == "--stats" {
+            config.print_stats = true;
         } else if let Some(alg_str) = arg.strip_prefix("--algorithm=") {
             match alg_str.parse::<u32>() {
                 Ok(v) => match QuantAlgorithm::try_from_u32(v) {
@@ -352,12 +360,50 @@ fn process_image(config: &Config) -> Result<()> {
 
     let output_bytes = process_image_bytes_common(&img_bytes, Some(config.clone()))?;
 
-    std::fs::write(&config.output_path, output_bytes).map_err(|e| {
+    std::fs::write(&config.output_path, &output_bytes).map_err(|e| {
         PixelSnapperError::ProcessingError(format!("Failed to write output file: {}", e))
     })?;
 
     println!("Saved to: {}", config.output_path);
+
+    if config.print_stats {
+        let output_img = image::load_from_memory(&output_bytes)?.to_rgba8();
+        println!("{}", stats_json(config, &regions::image_stats(&output_img)));
+    }
     Ok(())
+}
+
+/// One JSON object on one line. Deliberately free of paths and timings so that the
+/// lines can be committed as a regression baseline (`scripts/corpus-check.sh`).
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn stats_json(config: &Config, stats: &regions::ImageStats) -> String {
+    let raw_name = std::path::Path::new(&config.input_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut input_name = String::with_capacity(raw_name.len());
+    for ch in raw_name.chars() {
+        match ch {
+            '"' => input_name.push_str("\\\""),
+            '\\' => input_name.push_str("\\\\"),
+            c if (c as u32) < 0x20 => input_name.push_str(&format!("\\u{:04x}", c as u32)),
+            c => input_name.push(c),
+        }
+    }
+    format!(
+        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
+        input_name,
+        if config.no_resize { "no-resize" } else { "snap" },
+        config.k_colors,
+        config.algorithm as u32,
+        stats.width,
+        stats.height,
+        stats.unique_colors,
+        stats.regions,
+        stats.regions_lt4,
+        stats.regions_lt16,
+    )
 }
 
 fn validate_image_dimensions(width: u32, height: u32) -> Result<()> {
@@ -1365,7 +1411,9 @@ fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         }
     }
 
-    // Final assignment and output
+    // Output the spatially optimised assignments. Re-deriving the nearest palette
+    // colour per pixel here would throw the spatial term away and reintroduce the
+    // speckle this quantizer exists to remove.
     let srgb_palette: Vec<[u8; 3]> = palette.iter().map(|c| oklab_to_srgb(c)).collect();
     let mut new_img = RgbaImage::new(w, h);
     for (x, y, pixel) in img.enumerate_pixels() {
@@ -1373,17 +1421,9 @@ fn spatial_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
             new_img.put_pixel(x, y, *pixel);
             continue;
         }
-        let lab = srgb_to_oklab(pixel[0], pixel[1], pixel[2]);
-        let mut min_dist = f32::MAX;
-        let mut best = 0;
-        for (j, c) in palette.iter().enumerate() {
-            let dl = lab[0] - c[0];
-            let da = lab[1] - c[1];
-            let db = lab[2] - c[2];
-            let d = dl * dl + da * da + db * db;
-            if d < min_dist { min_dist = d; best = j; }
-        }
-        let c = srgb_palette[best];
+        let idx = coord_to_idx[y as usize * ww + x as usize]
+            .expect("every pixel with alpha > 0 was indexed above");
+        let c = srgb_palette[assignments[idx]];
         new_img.put_pixel(x, y, Rgba([c[0], c[1], c[2], pixel[3]]));
     }
     Ok(new_img)
@@ -1447,8 +1487,13 @@ fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         population.push(wolf);
     }
 
-    // Fitness = weighted MSE + diversity penalty for collapsed centroids
-    let diversity_penalty_weight = 0.001f64;
+    // Fitness = weighted MSE, inflated when two centroids have collapsed onto each
+    // other. The penalty is relative to the MSE and only active below a just-visible
+    // OKLab distance. An earlier additive `0.001 / min_pair_dist` term was two to
+    // three orders of magnitude larger than the MSE itself, so the pack optimised for
+    // spreading centroids apart, pushed most of them outside the image's colours, and
+    // returned 5 usable colours out of 16.
+    const COLLAPSE_DIST_SQ: f64 = 0.02 * 0.02;
     let evaluate = |wolf: &[f32]| -> f64 {
         // MSE term
         let mut mse = 0.0f64;
@@ -1479,11 +1524,27 @@ fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
                 if d < min_pair_dist { min_pair_dist = d; }
             }
         }
-        // Penalize: lower min-pair-distance = higher penalty
-        mse + diversity_penalty_weight / (min_pair_dist + 1e-8)
+        let collapse = if k > 1 {
+            (1.0 - min_pair_dist / COLLAPSE_DIST_SQ).max(0.0)
+        } else {
+            0.0
+        };
+        mse * (1.0 + collapse)
     };
 
     let mut fitness: Vec<f64> = population.iter().map(|w| evaluate(w)).collect();
+
+    // Elitism: every wolf, the leaders included, is moved each iteration, so without
+    // this the pack can end worse than the k-means palette it started from.
+    let (mut elite_fitness, mut elite) = {
+        let i = fitness
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        (fitness[i], population[i].clone())
+    };
 
     let mut best_fitness_ever = f64::MAX;
     let mut stagnation = 0usize;
@@ -1538,21 +1599,24 @@ fn gwo_quantize(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
             repair_wolf_palette(&mut population[wi], k, &sample_colors, &sample_weights_f32);
 
             fitness[wi] = evaluate(&population[wi]);
+            if fitness[wi] < elite_fitness {
+                elite_fitness = fitness[wi];
+                elite = population[wi].clone();
+            }
         }
     }
 
-    // Extract best wolf, final refinement on ALL pixels
-    let best_idx = fitness.iter().enumerate()
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-        .map(|(i, _)| i).unwrap_or(0);
-
-    let best_wolf = &population[best_idx];
+    // Best palette seen at any point, then final refinement on ALL pixels
+    let best_wolf = &elite;
     let mut palette_lab: Vec<[f32; 3]> = (0..k)
         .map(|i| [best_wolf[i * 3], best_wolf[i * 3 + 1], best_wolf[i * 3 + 2]])
         .collect();
 
-    // Final dedup + refinement on full pixel set
+    // Final dedup + refinement on full pixel set. Centroids that own no pixel are
+    // re-seeded first: k-means refinement never moves an empty cluster, so each one
+    // would otherwise be a palette slot the output cannot use.
     dedup_palette_oklab(&mut palette_lab, &pixels_lab, 8.0);
+    reseed_empty_clusters(&mut palette_lab, &pixels_lab);
     palette_lab = kmeans_refine_oklab(&pixels_lab, &palette_lab, 10);
 
     let palette_srgb: Vec<[u8; 3]> = palette_lab.iter().map(|c| oklab_to_srgb(c)).collect();
@@ -1872,8 +1936,15 @@ fn build_weighted_samples(pixels: &[[f32; 3]], max_samples: usize) -> Vec<([f32;
         entry.1 += 1;
     }
 
-    let mut samples: Vec<([f32; 3], usize)> = bins.values()
-        .map(|(sum, count)| {
+    // `HashMap` iterates in a different order in every process. The callers sum
+    // floating-point terms over these samples, so an unordered list made Grey Wolf and
+    // the differentiable quantizer vary slightly from run to run. Sort by bin first.
+    let mut binned: Vec<((u16, u16, u16), ([f64; 3], usize))> = bins.into_iter().collect();
+    binned.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut samples: Vec<([f32; 3], usize)> = binned
+        .iter()
+        .map(|(_, (sum, count))| {
             let n = *count as f64;
             ([
                 (sum[0] / n) as f32,
@@ -1883,7 +1954,7 @@ fn build_weighted_samples(pixels: &[[f32; 3]], max_samples: usize) -> Vec<([f32;
         })
         .collect();
 
-    // If too many bins, keep the most populated ones
+    // If too many bins, keep the most populated ones (stable: ties keep bin order)
     if samples.len() > max_samples {
         samples.sort_by(|a, b| b.1.cmp(&a.1));
         samples.truncate(max_samples);
@@ -1952,6 +2023,68 @@ fn dedup_palette_oklab(
 
         // Safety: don't loop forever
         if pass >= k * 2 { break; }
+    }
+}
+
+/// Replace every palette entry that is the nearest colour of no pixel with the pixel
+/// currently worst served by the palette, until no entry is empty or no pixel can be
+/// served better. Deterministic. O(n * k) to set up plus O(n) per re-seed.
+fn reseed_empty_clusters(palette: &mut [[f32; 3]], pixels: &[[f32; 3]]) {
+    let k = palette.len();
+    if k == 0 || pixels.is_empty() {
+        return;
+    }
+
+    let dist_sq = |p: &[f32; 3], c: &[f32; 3]| -> f32 {
+        let dl = p[0] - c[0];
+        let da = p[1] - c[1];
+        let db = p[2] - c[2];
+        dl * dl + da * da + db * db
+    };
+
+    let mut owner = vec![0usize; pixels.len()];
+    let mut owner_dist = vec![f32::MAX; pixels.len()];
+    let mut counts = vec![0usize; k];
+    for (i, p) in pixels.iter().enumerate() {
+        for (j, c) in palette.iter().enumerate() {
+            let d = dist_sq(p, c);
+            if d < owner_dist[i] {
+                owner_dist[i] = d;
+                owner[i] = j;
+            }
+        }
+        counts[owner[i]] += 1;
+    }
+
+    // Re-seeding one cluster can take every pixel of another (a new centroid placed
+    // between a donor's pixels and the donor's own centroid), so keep going until no
+    // cluster is empty. Each re-seed strictly lowers the total error, which bounds the
+    // loop; the explicit cap is a backstop.
+    for _ in 0..4 * k {
+        let Some(j) = counts.iter().position(|&c| c == 0) else { return };
+
+        // Worst-served pixel whose current cluster can spare it.
+        let mut worst: Option<usize> = None;
+        for i in 0..pixels.len() {
+            if counts[owner[i]] > 1 && worst.map_or(true, |w| owner_dist[i] > owner_dist[w]) {
+                worst = Some(i);
+            }
+        }
+        let Some(w) = worst else { return };
+        if owner_dist[w] <= 0.0 {
+            return; // every pixel is already represented exactly
+        }
+        palette[j] = pixels[w];
+        let centroid = palette[j];
+        for (i, p) in pixels.iter().enumerate() {
+            let d = dist_sq(p, &centroid);
+            if d < owner_dist[i] {
+                counts[owner[i]] -= 1;
+                counts[j] += 1;
+                owner[i] = j;
+                owner_dist[i] = d;
+            }
+        }
     }
 }
 
@@ -2908,5 +3041,393 @@ mod tests {
         assert_eq!(checksum(&r0b), checksum(&r0), "OKLab output changed between runs");
         assert_eq!(checksum(&r1b), checksum(&r1), "MedianCut output changed between runs");
         assert_eq!(checksum(&r2b), checksum(&r2), "Wu output changed between runs");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 0 of docs/plans/no-resize-cleanup-and-audition.md
+    // ------------------------------------------------------------------
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    /// FNV-1a over dimensions and raw RGBA. Stable across platforms and runs.
+    fn image_hash(img: &RgbaImage) -> u64 {
+        let mut bytes = Vec::with_capacity(8 + img.as_raw().len());
+        bytes.extend_from_slice(&img.width().to_le_bytes());
+        bytes.extend_from_slice(&img.height().to_le_bytes());
+        bytes.extend_from_slice(img.as_raw());
+        fnv1a(&bytes)
+    }
+
+    /// Cells of random palette colours with the given column widths and row heights,
+    /// optionally box-blurred (3x3) and noised: a stand-in for AI "pixel art".
+    /// Returns the image and the palette index of every cell, row-major.
+    fn synthetic_lattice(
+        col_widths: &[u32],
+        row_heights: &[u32],
+        palette: &[[u8; 3]],
+        blur: bool,
+        noise: i32,
+        seed: u64,
+    ) -> (RgbaImage, Vec<usize>) {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let (w, h) = (col_widths.iter().sum::<u32>(), row_heights.iter().sum::<u32>());
+        let truth: Vec<usize> = (0..col_widths.len() * row_heights.len())
+            .map(|_| rng.gen_range(0..palette.len()))
+            .collect();
+
+        let cell_of = |sizes: &[u32], pos: u32| -> usize {
+            let mut end = 0;
+            sizes.iter().position(|&s| { end += s; pos < end }).unwrap()
+        };
+        let mut sharp = vec![[0f32; 3]; (w * h) as usize];
+        for y in 0..h {
+            let cy = cell_of(row_heights, y);
+            for x in 0..w {
+                let c = palette[truth[cy * col_widths.len() + cell_of(col_widths, x)]];
+                sharp[(y * w + x) as usize] = [c[0] as f32, c[1] as f32, c[2] as f32];
+            }
+        }
+
+        let mut img = RgbaImage::new(w, h);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let mut acc = [0f32; 3];
+                let mut n = 0f32;
+                let r = if blur { 1 } else { 0 };
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let (sx, sy) = (x + dx, y + dy);
+                        if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
+                            let s = sharp[(sy as u32 * w + sx as u32) as usize];
+                            for ch in 0..3 { acc[ch] += s[ch]; }
+                            n += 1.0;
+                        }
+                    }
+                }
+                let mut px = [0u8, 0, 0, 255];
+                for ch in 0..3 {
+                    let v = (acc[ch] / n).round() as i32 + if noise > 0 { jitter(&mut rng, noise) } else { 0 };
+                    px[ch] = v.clamp(0, 255) as u8;
+                }
+                img.put_pixel(x as u32, y as u32, Rgba(px));
+            }
+        }
+        (img, truth)
+    }
+
+    fn decode(png: &[u8]) -> RgbaImage {
+        image::load_from_memory(png).unwrap().to_rgba8()
+    }
+
+    /// Deterministic noise in [-amp, amp] for test images.
+    fn jitter(rng: &mut ChaCha8Rng, amp: i32) -> i32 {
+        rng.gen_range(-amp..=amp)
+    }
+
+    /// The legacy snap path (`process_image` in WASM, the CLI without flags) must stay
+    /// byte-identical while the cleanup and audition features are built around it.
+    /// If one of these fails, the shipping output changed. Do not update the numbers
+    /// unless that was the explicit purpose of the change.
+    #[test]
+    fn golden_snap_outputs_unchanged() {
+        for (name, bytes, golden) in golden_fixtures() {
+            let png = process_image_bytes_common(bytes, None).unwrap();
+            let out = decode(&png);
+            assert_eq!(
+                (out.dimensions(), image_hash(&out)),
+                (golden.dims, golden.pixels),
+                "snap pixels changed for fixture {name}"
+            );
+            assert_eq!(fnv1a(&png), golden.png, "snap PNG bytes changed for fixture {name}");
+        }
+    }
+
+    struct Golden {
+        dims: (u32, u32),
+        /// `image_hash` of the decoded output.
+        pixels: u64,
+        /// `fnv1a` of the encoded PNG, i.e. of exactly what WASM callers receive.
+        png: u64,
+    }
+
+    /// Recorded from a build of commit 07639e1 (before any change in this plan).
+    fn golden_fixtures() -> [(&'static str, &'static [u8], Golden); 4] {
+        [
+            ("wolf_ear_128", include_bytes!("../tests/fixtures/wolf_ear_128.png"),
+             Golden { dims: (27, 28), pixels: 6713833453265201509, png: 947589675843777480 }),
+            ("colliseum_128", include_bytes!("../tests/fixtures/colliseum_128.png"),
+             Golden { dims: (18, 17), pixels: 13602311384345898275, png: 4676570098897378795 }),
+            ("ogtrail_128", include_bytes!("../tests/fixtures/ogtrail_128.png"),
+             Golden { dims: (28, 29), pixels: 15054130488601863358, png: 9896674800335519 }),
+            ("wolf_ear_128_alpha", include_bytes!("../tests/fixtures/wolf_ear_128_alpha.png"),
+             Golden { dims: (28, 27), pixels: 17224838603501464911, png: 16249669298831622531 }),
+        ]
+    }
+
+    /// Two flat halves with a few stray pixels in the left one whose colour is slightly
+    /// nearer the right half's. Per-pixel nearest colour paints them as the right half;
+    /// the spatial optimiser assigns them to their surroundings. Transparent pixels are
+    /// scattered throughout so that a wrong pixel-to-assignment mapping scrambles the
+    /// picture instead of passing by luck.
+    #[test]
+    fn spatial_output_uses_optimised_assignments() {
+        let (w, h) = (24u32, 24u32);
+        let left = [90u8, 90, 90];
+        let right = [170u8, 170, 170];
+        let stray = [136u8, 136, 136];
+        let hidden = Rgba([1u8, 2, 3, 0]);
+        let stray_at = [(3u32, 3u32), (8, 5), (4, 12), (7, 19), (2, 21), (9, 9)];
+
+        let mut img = RgbaImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let c = if x < w / 2 { left } else { right };
+            *p = Rgba([c[0], c[1], c[2], 255]);
+            if (x * 7 + y * 13) % 11 == 0 {
+                *p = hidden;
+            }
+        }
+        for &(x, y) in &stray_at {
+            img.put_pixel(x, y, Rgba([stray[0], stray[1], stray[2], 255]));
+        }
+
+        // Sanity: the stray colour really is nearer the right half in OKLab.
+        let d = |a: [u8; 3], b: [u8; 3]| {
+            let (a, b) = (srgb_to_oklab(a[0], a[1], a[2]), srgb_to_oklab(b[0], b[1], b[2]));
+            (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+        };
+        assert!(d(stray, right) < d(stray, left));
+
+        let config = Config { k_colors: 2, ..Default::default() };
+        let out = spatial_quantize(&img, &config).unwrap();
+
+        let mut left_colour = None;
+        let mut right_colour = None;
+        for (x, y, p) in out.enumerate_pixels() {
+            if img.get_pixel(x, y)[3] == 0 {
+                assert_eq!(*p, hidden, "transparent pixel at ({x},{y}) was modified");
+                continue;
+            }
+            assert_eq!(p[3], 255);
+            let rgb = [p[0], p[1], p[2]];
+            let side = if x < w / 2 { &mut left_colour } else { &mut right_colour };
+            match side {
+                None => *side = Some(rgb),
+                Some(c) => assert_eq!(*c, rgb, "pixel ({x},{y}) does not match its half"),
+            }
+        }
+        assert_ne!(left_colour, right_colour);
+    }
+
+    /// Noise straddling the boundary between two palette colours is where per-pixel
+    /// assignment speckles. The spatial quantizer must clean that up without erasing
+    /// small deliberate features.
+    #[test]
+    fn spatial_smooths_noise_and_keeps_small_features() {
+        let (w, h) = (48u32, 48u32);
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut img = RgbaImage::new(w, h);
+        for p in img.pixels_mut() {
+            let v = (110 + jitter(&mut rng, 10)) as u8;
+            *p = Rgba([v, v, v, 255]);
+        }
+        // 2x2 black features on a coarse grid.
+        let features: Vec<(u32, u32)> = (0..4)
+            .flat_map(|i| (0..3).map(move |j| (6 + i * 11, 8 + j * 14)))
+            .collect();
+        for &(fx, fy) in &features {
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                img.put_pixel(fx + dx, fy + dy, Rgba([0, 0, 0, 255]));
+            }
+        }
+
+        let config = Config { k_colors: 3, ..Default::default() };
+        let plain = quantize_image_oklab(&img, &config).unwrap();
+        let spatial = spatial_quantize(&img, &config).unwrap();
+
+        let plain_specks = regions::image_stats(&plain).regions_lt4;
+        let spatial_specks = regions::image_stats(&spatial).regions_lt4;
+        assert!(plain_specks > 100, "test image should speckle under plain k-means, got {plain_specks}");
+        assert!(
+            spatial_specks * 4 < plain_specks,
+            "spatial left {spatial_specks} specks against {plain_specks} for plain k-means"
+        );
+
+        let darkest = spatial
+            .pixels()
+            .map(|p| [p[0], p[1], p[2]])
+            .min_by_key(|c| c[0] as u32 + c[1] as u32 + c[2] as u32)
+            .unwrap();
+        assert!(darkest[0] < 40, "black should have its own palette entry, darkest is {darkest:?}");
+        for &(fx, fy) in &features {
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let p = spatial.get_pixel(fx + dx, fy + dy);
+                assert_eq!([p[0], p[1], p[2]], darkest, "feature at ({fx},{fy}) was erased");
+            }
+            // ...and it is still a 2x2 feature: nothing on its 4x4 perimeter is black.
+            for dy in -1i32..=2 {
+                for dx in -1i32..=2 {
+                    if (0..=1).contains(&dx) && (0..=1).contains(&dy) {
+                        continue;
+                    }
+                    let p = spatial.get_pixel((fx as i32 + dx) as u32, (fy as i32 + dy) as u32);
+                    assert_ne!([p[0], p[1], p[2]], darkest, "feature at ({fx},{fy}) grew");
+                }
+            }
+        }
+    }
+
+    /// The same promise on the kind of image the tool is for: a blurred, noisy lattice.
+    #[test]
+    fn spatial_reduces_speckle_on_a_blurred_lattice() {
+        let palette = [[20u8, 20, 24], [235, 232, 225], [128, 126, 130], [170, 60, 50], [60, 90, 160]];
+        let (mut img, _) = synthetic_lattice(&[8; 12], &[8; 12], &palette, true, 6, 3);
+        // A marked 2x2 feature in a colour of its own, centred in a cell.
+        let feature = [250u8, 220, 40];
+        let (fx, fy) = (8 * 5 + 3, 8 * 6 + 3);
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            img.put_pixel(fx + dx, fy + dy, Rgba([feature[0], feature[1], feature[2], 255]));
+        }
+
+        let config = Config { k_colors: 6, ..Default::default() };
+        let plain = regions::image_stats(&quantize_image_oklab(&img, &config).unwrap());
+        let spatial_img = spatial_quantize(&img, &config).unwrap();
+        let spatial = regions::image_stats(&spatial_img);
+        // Measured when written: 73 regions under 16 px for plain k-means, 14 for spatial.
+        assert!(
+            spatial.regions_lt16 * 2 < plain.regions_lt16,
+            "spatial left {} regions under 16 px against {} for plain k-means",
+            spatial.regions_lt16, plain.regions_lt16
+        );
+
+        let centre = spatial_img.get_pixel(fx, fy);
+        let around = spatial_img.get_pixel(fx - 2, fy);
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(spatial_img.get_pixel(fx + dx, fy + dy), centre, "feature is not one colour");
+        }
+        assert_ne!(centre, around, "feature was absorbed into its cell");
+    }
+
+    /// Sixteen clearly different colours and a budget of sixteen: nearly all of the
+    /// budget must be used. Grey Wolf used to return 5 colours on real images.
+    #[test]
+    fn gwo_uses_its_palette_budget() {
+        let colours: Vec<[u8; 3]> = (0..16u32)
+            .map(|i| {
+                let r = 30 + (i % 4) * 65;
+                let g = 30 + (i / 4) * 65;
+                let b = 40 + ((i * 7) % 16) * 12;
+                [r as u8, g as u8, b as u8]
+            })
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let mut img = RgbaImage::new(64, 64);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let c = colours[((y / 16) * 4 + x / 16) as usize];
+            let mut px = [0u8; 4];
+            for ch in 0..3 {
+                px[ch] = (c[ch] as i32 + jitter(&mut rng, 3)).clamp(0, 255) as u8;
+            }
+            px[3] = 255;
+            *p = Rgba(px);
+        }
+
+        let config = Config { k_colors: 16, ..Default::default() };
+        let out = gwo_quantize(&img, &config).unwrap();
+        let used = count_unique_colors(&out);
+        assert!(used >= 14, "Grey Wolf used {used} of 16 colours");
+    }
+
+    #[test]
+    fn reseed_gives_every_cluster_a_pixel() {
+        let pixels: Vec<[f32; 3]> = vec![
+            [0.1, 0.0, 0.0], [0.1, 0.0, 0.0], [0.5, 0.0, 0.0], [0.9, 0.0, 0.0],
+        ];
+        // Two centroids far from every pixel: they own nothing.
+        let mut palette = vec![[0.1, 0.0, 0.0], [5.0, 5.0, 5.0], [-5.0, 5.0, 5.0]];
+        reseed_empty_clusters(&mut palette, &pixels);
+        for c in &palette {
+            assert!(pixels.contains(c), "centroid {c:?} is not at a pixel");
+        }
+        let mut distinct = palette.clone();
+        distinct.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3);
+    }
+
+    /// Re-seeding one cluster can take all the pixels of a cluster visited earlier
+    /// (example from Codex's Phase 0 review); that one must be repaired too.
+    #[test]
+    fn reseed_repairs_clusters_it_empties() {
+        let px = |l: f32| [l, 0.0, 0.0];
+        let pixels = vec![px(0.1), px(0.1), px(0.5), px(0.51)];
+        let mut palette = vec![px(0.15), px(0.505), px(1.0)];
+        reseed_empty_clusters(&mut palette, &pixels);
+
+        let occupancy = |palette: &[[f32; 3]]| -> Vec<usize> {
+            let mut counts = vec![0; palette.len()];
+            for p in &pixels {
+                let best = (0..palette.len())
+                    .min_by(|&a, &b| {
+                        (p[0] - palette[a][0]).abs().partial_cmp(&(p[0] - palette[b][0]).abs()).unwrap()
+                    })
+                    .unwrap();
+                counts[best] += 1;
+            }
+            counts
+        };
+        assert!(occupancy(&palette).iter().all(|&c| c > 0), "after reseed: {palette:?}");
+        let refined = kmeans_refine_oklab(&pixels, &palette, 10);
+        assert!(occupancy(&refined).iter().all(|&c| c > 0), "after refinement: {refined:?}");
+    }
+
+    /// `build_weighted_samples` bins through a `HashMap`, whose iteration order differs
+    /// between instances. Its output order must not.
+    #[test]
+    fn weighted_samples_have_a_stable_order() {
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let pixels: Vec<[f32; 3]> = (0..5000)
+            .map(|_| [rng.gen::<f32>(), rng.gen::<f32>() - 0.5, rng.gen::<f32>() - 0.5])
+            .collect();
+        let first = build_weighted_samples(&pixels, 10000);
+        assert!(first.len() > 1000);
+        for _ in 0..5 {
+            assert_eq!(build_weighted_samples(&pixels, 10000), first);
+        }
+        // Truncation keeps the most populated bins, deterministically.
+        let truncated = build_weighted_samples(&pixels, 50);
+        assert_eq!(truncated.len(), 50);
+        assert_eq!(build_weighted_samples(&pixels, 50), truncated);
+    }
+
+    #[test]
+    fn stats_json_escapes_control_characters() {
+        let config = Config { input_path: "a\nb\tc\u{1}.png".to_string(), ..Default::default() };
+        let stats = regions::ImageStats {
+            width: 1, height: 1, unique_colors: 1, regions: 1, regions_lt4: 1, regions_lt16: 1,
+        };
+        let line = stats_json(&config, &stats);
+        assert!(!line.contains('\n') && !line.contains('\t'));
+        assert!(line.starts_with(r#"{"input":"a\u000ab\u0009c\u0001.png","mode":"snap""#), "{line}");
+    }
+
+    #[test]
+    fn stats_json_is_one_stable_line() {
+        let config = Config {
+            input_path: "some/dir/wolf \"x\".png".to_string(),
+            no_resize: true,
+            algorithm: QuantAlgorithm::SpatialQuantization,
+            ..Default::default()
+        };
+        let stats = regions::ImageStats {
+            width: 4, height: 3, unique_colors: 2, regions: 5, regions_lt4: 1, regions_lt16: 5,
+        };
+        assert_eq!(
+            stats_json(&config, &stats),
+            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
+        );
     }
 }
