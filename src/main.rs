@@ -13,6 +13,8 @@ use std::fmt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod grid;
+mod indexed;
 mod regions;
 
 #[repr(u32)]
@@ -215,28 +217,8 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
     } else {
         // Existing pipeline: RGB k-means quantize + grid detection + resampling
         let quantized_img = quantize_image(&rgba_img, &config)?;
-        let (profile_x, profile_y) = compute_profiles(&quantized_img)?;
-
-        let step_x_opt = estimate_step_size(&profile_x, &config);
-        let step_y_opt = estimate_step_size(&profile_y, &config);
-
-        let (step_x, step_y) =
-            resolve_step_sizes(step_x_opt, step_y_opt, width, height, &config);
-
-        let raw_col_cuts = walk(&profile_x, step_x, width as usize, &config)?;
-        let raw_row_cuts = walk(&profile_y, step_y, height as usize, &config)?;
-
-        let (col_cuts, row_cuts) = stabilize_both_axes(
-            &profile_x,
-            &profile_y,
-            raw_col_cuts,
-            raw_row_cuts,
-            width as usize,
-            height as usize,
-            &config,
-        );
-
-        resample(&quantized_img, &col_cuts, &row_cuts)?
+        let grid = grid::detect_grid(&quantized_img, &config)?;
+        resample(&quantized_img, &grid.cols, &grid.rows)?
     };
 
     // Returns bytes for both implementations

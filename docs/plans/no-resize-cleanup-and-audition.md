@@ -406,3 +406,26 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
 - Noticed, not acted on: shipping snap gives 169×169 on the sprite sheet, whose true
   grid is 256×256 (pitch 4). Another wrong estimate for the ladder to mitigate.
 
+### Phase 1 — done
+
+- `src/indexed.rs` (`IndexedImage`, `index_image`, `render`) and `src/grid.rs` (`Grid`,
+  `detect_grid`, `refine_grid`). The snap branch is now `detect_grid` + `resample`; the
+  golden tests and the corpus check pass unchanged.
+- `detect_grid` calls the existing functions in `main.rs` in the existing order; they
+  were not moved into the module, only the call sequence was.
+- Both modules carry `#![allow(dead_code)]` until Phase 2 gives them callers.
+- Deviation: `refine_grid` enforces the 2 px minimum on **every** cell (the merge rule
+  runs on integer subdivisions too, because the legacy walker can hand over 1 px cells),
+  so the plan's "median cell under 2 px" rejection became redundant and was dropped.
+- Codex review (`docs/reviews/phase-1-review.md`): three findings, all fixed (surviving
+  1 px cells, an allocation sized by an uncapped scale, an untested 1.2× threshold).
+- **Found: the legacy estimator cannot see crisp pixel art.** `estimate_step_size`
+  requires a strict local maximum in the gradient profile. A perfectly sharp edge gives
+  two equal adjacent samples, so nearest-neighbour-upscaled art produces no estimate on
+  either axis and falls back to `min(w, h) / 64`. Checked on the real binary: the wolf's
+  205×208 snap output, upscaled ×5 with nearest neighbour, snaps back to 68×70. This is
+  shipping behaviour, pinned by the test `crisp_edges_defeat_the_legacy_step_estimate`,
+  and is **not fixed here** because the legacy path is frozen. It is the strongest
+  argument so far for the opt-in fitter of Phase 4, which should carry a plateau-tolerant
+  estimate; whether to also fix the legacy default is a decision for the owner.
+
