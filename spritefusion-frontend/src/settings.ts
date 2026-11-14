@@ -19,6 +19,11 @@ export interface ProcessSettings {
    * where sizes are offered: snap mode and Blocks.
    */
   targetWidth: number;
+  /**
+   * How a grid cell's colour is chosen: 0 the majority (clean), 1 detail (pixels that
+   * differ from their surroundings count for more). Only used where sizes are offered.
+   */
+  vote: number;
 }
 
 export const CLEANUP_OFF = 0;
@@ -30,6 +35,8 @@ export const STRENGTH_LIGHT = 1;
 export const STRENGTH_NAMES = ['', 'light', 'medium', 'strong'];
 export const FITTER_WALK = 0;
 export const FITTER_NAMES = ['Standard', 'Elastic'];
+export const VOTE_MAJORITY = 0;
+export const VOTE_DETAIL = 1;
 
 export const DEFAULT_SETTINGS: ProcessSettings = {
   kColors: 16,
@@ -39,6 +46,7 @@ export const DEFAULT_SETTINGS: ProcessSettings = {
   cleanupStrength: STRENGTH_LIGHT,
   gridFitter: FITTER_WALK,
   targetWidth: 0,
+  vote: VOTE_MAJORITY,
 };
 
 /** Modes that produce several sizes to choose from. */
@@ -66,6 +74,7 @@ export function effectiveSettings(s: ProcessSettings): ProcessSettings {
     // Plain palette reduction uses no grid at all.
     gridFitter: s.cleanup === CLEANUP_OFF ? FITTER_WALK : s.gridFitter,
     targetWidth: s.cleanup === CLEANUP_BLOCKS ? s.targetWidth : 0,
+    vote: s.cleanup === CLEANUP_BLOCKS ? s.vote : VOTE_MAJORITY,
   };
 }
 
@@ -73,8 +82,8 @@ export function effectiveSettings(s: ProcessSettings): ProcessSettings {
 export function settingsKey(s: ProcessSettings): string {
   const e = effectiveSettings(s);
   return e.noResize
-    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridFitter}:${e.targetWidth}`
-    : `snap:${e.kColors}:${e.gridFitter}:${e.targetWidth}`;
+    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridFitter}:${e.targetWidth}:${e.vote}`
+    : `snap:${e.kColors}:${e.gridFitter}:${e.targetWidth}:${e.vote}`;
 }
 
 /** Lattice score at or above which the image clearly has a pixel grid. */

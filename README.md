@@ -97,8 +97,10 @@ Optional flags after the color count:
 | `--strength=light\|medium\|strong` | For `--cleanup=smooth`: remove regions under 4, 8 or 16 px (more on coarse grids). Default `light` |
 | `--grid-scale=<1-16>` | Work on a grid this many times finer than the detected one. Use 1.5, 2 or 3 when details are being lost. Applies to the snapped output and to `--cleanup=blocks`. Cells are never smaller than 2 px |
 | `--grid-fitter=walk\|dp` | How the pixel grid is found. `walk` is the original and the default. `dp` fits the grid to edges in the source image with a globally optimal elastic fit: it handles perfectly crisp (nearest-neighbor upscaled) pixel art, which `walk` cannot measure, and places cell borders more exactly. Experimental; it changes the snapped output |
+| `--vote=majority\|detail` | How each grid cell gets its color, for the snapped output and `--cleanup=blocks`. `majority` (default) takes the color most of the cell has. `detail` lets pixels that differ from their surroundings count for more: it keeps thin lines, lettering and small features that the majority erases, and it turns texture into noise |
 | `--target-width=<cells>` | Ask for a grid about this many cells wide, instead of `--grid-scale`. On an image with a pixel grid the result follows the grid and may land a few cells off; on one without, the width is exact |
 | `--candidates` | Write several sizes instead of one: the detected grid and finer ones (and `--target-width` if given), as `output.<cols>x<rows>.png`, with one JSON line each. No measurable property of an image picks the right size, so the tool offers a ladder and you choose. Works for the snapped output and for `--cleanup=blocks` |
+| `--lost-detail` | With `--candidates`: also write `output.<cols>x<rows>.lost-detail.png`, one gray pixel per grid cell, white where that size is losing detail a finer size would keep |
 | `--stats` | Print one JSON line describing the output: size, grid, color count, and how many same-color regions are under 4 px and under 16 px |
 
 ```bash
@@ -139,6 +141,7 @@ opts.cleanup = 1;       // 0 off, 1 blocks, 2 smooth
 opts.cleanup_strength = 1; // for smooth: 1 light, 2 medium, 3 strong
 opts.grid_scale = 2;    // 1 to 16
 opts.grid_fitter = 0;   // 0 original walker, 1 elastic fit (experimental)
+opts.vote = 0;          // 0 majority, 1 detail (keeps thin features, noisier)
 try {
   const outputPng = process_image_with(inputBytes, opts);
 } finally {
@@ -164,6 +167,7 @@ const results = process_candidates(inputBytes, opts).map((c) => {
     latticeScore: c.lattice_score,   // >= 0.20 clear pixel grid, < 0.07 none found
     isLegacy: c.is_legacy,           // exactly what process_image returns
     colCuts: c.col_cuts, rowCuts: c.row_cuts,
+    lostDetail: c.lost_detail,       // one byte per cell: 255 = this size loses a lot here
   };
   c.free();
   return r;

@@ -703,3 +703,58 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
   that mattered: a typed width could vanish from the strip when it was close to another
   size, and a large set arriving could be evicted from the cache before it was shown.
 
+
+### Phase 6 — done
+
+- `cleanup.rs`: `Vote { Majority, Detail }`, `vote_cells_detail`, `resample_detail`;
+  `BlocksPrep::render(grid, vote)` (it now keeps the raw labels and the source in OKLab,
+  which was deferred from Phase 3). `grid.rs`: `LabImage::lost_detail`. Every candidate
+  carries its lost-detail map. CLI `--vote=majority|detail`, `--lost-detail`;
+  `ProcessOptions.vote`; `Candidate.lost_detail`.
+- Frontend: in the Sizes strip, a "Cells: Clean / Detail" select and a "Show lost detail"
+  checkbox. The tint is drawn on a canvas laid out exactly like the processed image,
+  cell by cell from the candidate's cuts.
+- **Detail vote on the test images** (16 colours):
+  - ogtrail at the estimate's size (181×103, snap): the majority reads "Dragon Trail
+    Mr"; Detail reads "Dregon Trail Mix". "Trail Mix" is recovered, the "O" is not.
+    The "done when" asked for "Oregon Trail" readable: **partly met.**
+  - city at 168×154 and 109×119 (Blocks): Detail keeps the cars' dark outlines, which
+    the majority loses, and adds noise on the facades, as the research found.
+- **Lost-detail map on ogtrail** at 181×103: 13 % of the sky's cells are tinted at all
+  (mean value 0.06 of full scale), against 63 % of the wagon and people (0.29) and 44 %
+  of the lettering (0.26). At 427×246: 6 % (0.03), 38 % (0.17) and 35 % (0.18). The
+  second half of the "done when" (lights up the lettering and the wagon, not the sky)
+  is met. Mean value over the image falls with every finer rung: 40, 32, 27, 22.
+- Timings are unchanged by the maps (a ladder still takes 0.5 to 0.9 s natively).
+- Things learned about the detail vote, now in its doc comment:
+  - In a flat neighbourhood almost any pixel of another colour outweighs the rest of its
+    cell. That is why it keeps a stroke a third of a cell wide, and why texture and
+    leftover speckle become noise. Weights of distance to the power 0.5 and 0.75 were
+    tried to soften that: both lost the lettering ("Dragon Troil Mra"), so the planned
+    weight (distance, power 1) stays.
+  - Where neighbouring cells have different colours the local average sits between them
+    and thin features no longer stand out; there Detail behaves much like the majority.
+  - A feature that runs the whole height or width of an image can attract the grid's
+    cuts to its own edges. It then has cells of its own and every vote keeps it.
+  - A lone cell of two colours is always an exact tie under this vote, whatever their
+    shares: the reference is then the cell's own mean, and deviations from a mean
+    balance. Only the neighbouring cells decide which colour "stands out".
+- Deviations from the plan:
+  - *The overlay is rasterised in the frontend, from the cuts,* not by Rust. The plan
+    wanted Rust to rasterise it so that it would line up with cells of varying width.
+    Every candidate already carries its cuts, so the frontend can paint each cell's own
+    rectangle exactly; doing it there means the map is one byte per cell instead of a
+    second full-size image per candidate, and toggling it costs no engine run.
+  - *The map has a floor.* Values under one just-noticeable difference (0.02 OKLab) read
+    zero. Without it noise and soft shading tinted 99.8 % of the cells faintly.
+  - *Snap mode's Detail output decides alpha per cell* (opaque when at least half the
+    cell's pixels are). The majority snap output keeps the legacy vote on whole RGBA
+    values.
+  - The detail vote applies to every candidate at once (a select), not side by side.
+- A slip of mine: the first version of the lost-detail figures above was written before
+  the measurement had finished, and three of them were wrong. They were corrected from
+  the real output before the review came back.
+- Codex review (`docs/reviews/phase-6-review.md`): no defect found; five gaps in the
+  tests, all closed. The overlay's painting is now a pure, tested function
+  (`spritefusion-frontend/src/overlay.ts`), and the frontend has 18 tests.
+

@@ -358,6 +358,18 @@ body {
   object-fit: cover;
 }
 
+/* The lost-detail tint: laid out exactly like the processed image it covers. */
+.comparison-overlay {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
+  width: 100%;
+  object-fit: cover;
+  image-rendering: pixelated;
+  pointer-events: none;
+}
+
 .comparison-divider {
   position: absolute;
   top: 0;
@@ -764,5 +776,15 @@ body {
 .candidate-note {
   font-size: 0.7rem;
   color: var(--text-muted);
+}
+
+.candidates-overlay {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
 }
 

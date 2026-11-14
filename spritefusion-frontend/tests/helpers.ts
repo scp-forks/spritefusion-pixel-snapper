@@ -14,6 +14,9 @@ export function result(cols: number, extra: Partial<CachedResult> = {}): CachedR
     rows: cols,
     gridScale: 2,
     isLegacy: false,
+    colCuts: new Uint32Array(0),
+    rowCuts: new Uint32Array(0),
+    lostDetail: new Uint8Array(0),
     ...extra,
   };
 }

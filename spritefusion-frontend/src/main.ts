@@ -49,6 +49,8 @@ interface AppState {
   /** The set of results on screen, and which of them is in the comparison view. */
   current: ResultSet | null;
   selected: number;
+  /** Tint the result where it is losing detail a finer size would keep. */
+  showLostDetail: boolean;
   /** What the controls currently say; hidden controls keep their value. */
   settings: ProcessSettings;
   isProcessing: boolean;
@@ -63,6 +65,7 @@ const state: AppState = {
   originalUniqueColors: 0,
   current: null,
   selected: 0,
+  showLostDetail: false,
   settings: { ...DEFAULT_SETTINGS },
   isProcessing: false,
 };
@@ -128,7 +131,32 @@ const candidates = createCandidates(candidatesEl, {
     selectTypedWidth = width > 0;
     runProcess();
   },
+  onVote: (vote) => {
+    state.settings.vote = vote;
+    runProcess();
+  },
+  onOverlay: (on) => {
+    state.showLostDetail = on;
+    renderOverlay();
+  },
 });
+
+/** Draw, or clear, the lost-detail tint for the result in the comparison view. */
+function renderOverlay() {
+  const result = selectedResult();
+  const drawable = state.showLostDetail && result && result.cols > 0;
+  comparison.setOverlay(
+    drawable
+      ? {
+          width: result.width,
+          height: result.height,
+          colCuts: result.colCuts,
+          rowCuts: result.rowCuts,
+          values: result.lostDetail,
+        }
+      : null,
+  );
+}
 
 function selectedResult(): CachedResult | null {
   return state.current?.results[state.selected] ?? null;
@@ -224,6 +252,7 @@ function showResult(set: ResultSet, index: number) {
   } else {
     candidates.update(set, index);
   }
+  renderOverlay();
   renderStats();
   statsEl.classList.remove('hidden');
   toolbarEl.classList.remove('hidden');
@@ -279,6 +308,9 @@ async function runProcess() {
       rows: c.rows,
       gridScale: c.gridScale,
       isLegacy: c.isLegacy,
+      colCuts: c.colCuts,
+      rowCuts: c.rowCuts,
+      lostDetail: c.lostDetail,
     }));
 
     // A new image landed mid-run: these results belong to the old one.

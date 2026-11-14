@@ -4,7 +4,7 @@
 //! estimate was right once, a step too coarse once, 2.6 times too coarse once, and
 //! meaningless once. So the engine offers a ladder and a person chooses.
 
-use crate::cleanup::{self, grid_at_scale};
+use crate::cleanup::{self, grid_at_scale, Vote};
 use crate::grid::{self, Grid, GridFitter, LabImage, Profiles, MIN_CELL_PX};
 use crate::{quantize_image, quantize_no_resize, resample, Cleanup, Config, PixelSnapperError, Result};
 use image::RgbaImage;
@@ -75,6 +75,21 @@ pub fn grid_for_width(
         Ok(grid::even_grid(width as usize, height as usize, target_width as usize, rows))
     } else {
         Ok(grid::grid_for_cols(base, profiles, target_width as usize, width, height))
+    }
+}
+
+/// The small snap-mode image for `grid`: the legacy `resample` for the majority vote
+/// (so that the default path stays byte-identical), [`cleanup::resample_detail`] for
+/// the detail vote.
+pub fn snap_image(
+    source: &RgbaImage,
+    quantized: &RgbaImage,
+    grid: &Grid,
+    vote: Vote,
+) -> Result<RgbaImage> {
+    match vote {
+        Vote::Majority => resample(quantized, &grid.cols, &grid.rows),
+        Vote::Detail => cleanup::resample_detail(source, quantized, grid),
     }
 }
 
@@ -151,8 +166,11 @@ pub struct CandidateImage {
     /// of one image), or 0 when no grid is involved.
     pub lattice_score: f32,
     /// True for the result the original `process_image` gives: snap mode, the legacy
-    /// fitter, the detected grid.
+    /// fitter, the majority vote, the detected grid.
     pub is_legacy: bool,
+    /// [`LabImage::lost_detail`] on this candidate's grid: one byte per cell,
+    /// row-major. Empty when there is no grid.
+    pub lost_detail: Vec<u8>,
 }
 
 /// Every candidate for `rgba` under `config`.
@@ -177,14 +195,16 @@ pub fn build(rgba: &RgbaImage, config: &Config) -> Result<Vec<CandidateImage>> {
         let profiles = grid::profiles(rgba, &quantized, config)?;
         // The legacy grid is used exactly as detected, 1 px cells included.
         let base = grid::detect(&profiles, width, height, config)?;
-        let score = LabImage::new(rgba).lattice_score(&base);
-        let legacy_fitter = config.grid_fitter == GridFitter::Walk;
+        let lab = LabImage::new(rgba);
+        let score = lab.lattice_score(&base);
+        let legacy_path = config.grid_fitter == GridFitter::Walk && config.vote == Vote::Majority;
         return ladder(&base, score, &profiles, width, height, config)?
             .into_iter()
             .map(|rung| {
                 Ok(CandidateImage {
-                    image: resample(&quantized, &rung.grid.cols, &rung.grid.rows)?,
-                    is_legacy: legacy_fitter && rung.grid == base,
+                    image: snap_image(rgba, &quantized, &rung.grid, config.vote)?,
+                    is_legacy: legacy_path && rung.grid == base,
+                    lost_detail: lab.lost_detail(&rung.grid),
                     grid: Some(rung.grid),
                     grid_scale: rung.grid_scale,
                     lattice_score: score,
@@ -196,11 +216,13 @@ pub fn build(rgba: &RgbaImage, config: &Config) -> Result<Vec<CandidateImage>> {
     let quantized = quantize_no_resize(rgba, config)?;
     if config.cleanup == Cleanup::Blocks {
         if let Some(prep) = cleanup::prepare_blocks(rgba, &quantized, config)? {
-            let score = LabImage::new(rgba).lattice_score(&prep.base);
+            let lab = LabImage::new(rgba);
+            let score = lab.lattice_score(&prep.base);
             return Ok(ladder(&prep.base, score, &prep.profiles, width, height, config)?
                 .into_iter()
                 .map(|rung| CandidateImage {
-                    image: prep.render(&rung.grid),
+                    image: prep.render(&rung.grid, config.vote),
+                    lost_detail: lab.lost_detail(&rung.grid),
                     grid: Some(rung.grid),
                     grid_scale: rung.grid_scale,
                     lattice_score: score,
@@ -214,7 +236,14 @@ pub fn build(rgba: &RgbaImage, config: &Config) -> Result<Vec<CandidateImage>> {
         Cleanup::Smooth => cleanup::smooth(rgba, &quantized, config)?.image,
         Cleanup::Off | Cleanup::Blocks => quantized,
     };
-    Ok(vec![CandidateImage { image, grid: None, grid_scale: 1.0, lattice_score: 0.0, is_legacy: false }])
+    Ok(vec![CandidateImage {
+        image,
+        grid: None,
+        grid_scale: 1.0,
+        lattice_score: 0.0,
+        is_legacy: false,
+        lost_detail: Vec::new(),
+    }])
 }
 
 #[cfg(test)]
@@ -428,7 +457,7 @@ mod tests {
                 }
             }
             for (name, image) in [("erased", erased), ("recoloured", recoloured)] {
-                let fake = CandidateImage { image, grid: None, grid_scale: 1.0, lattice_score: 0.0, is_legacy: false };
+                let fake = CandidateImage { image, grid: None, grid_scale: 1.0, lattice_score: 0.0, is_legacy: false, lost_detail: Vec::new() };
                 assert!(rows_with_line(&fake) < 150, "{fitter:?}: the check passes on a {name} line");
             }
         }
@@ -535,5 +564,227 @@ mod tests {
                 assert!(base.with_min_cells().cols.iter().all(|c| doubled.cols.contains(c)));
             }
         }
+    }
+
+    // ---------------------------------------------- lost-detail map, votes
+
+    fn exact_grid(cols: &[u32], rows: &[u32]) -> Grid {
+        let cuts = |sizes: &[u32]| {
+            let mut out = vec![0usize];
+            for s in sizes {
+                out.push(out.last().unwrap() + *s as usize);
+            }
+            out
+        };
+        Grid { cols: cuts(cols), rows: cuts(rows), step: (8.0, 8.0), step_estimated: true }
+    }
+
+    /// Nothing is lost on the grid that explains the image; something is lost in every
+    /// cell that straddles two colours when the grid is twice as coarse.
+    #[test]
+    fn lost_detail_is_zero_on_the_right_grid_and_not_on_a_coarser_one() {
+        let (cols, rows) = (vec![6u32, 9, 7, 11, 8, 6, 10, 7], vec![8u32, 6, 10, 7, 9, 8]);
+        let (img, truth) = synthetic_lattice(&cols, &rows, &DISTINCT_8, false, 0, 13);
+        let lab = LabImage::new(&img);
+
+        let exact = exact_grid(&cols, &rows);
+        let map = lab.lost_detail(&exact);
+        assert_eq!(map.len(), 8 * 6);
+        assert!(map.iter().all(|&v| v == 0), "{map:?}");
+
+        // Merge the cells in pairs: 4 x 3 double cells.
+        let merge = |sizes: &[u32]| sizes.chunks(2).map(|c| c.iter().sum()).collect::<Vec<u32>>();
+        let coarse = exact_grid(&merge(&cols), &merge(&rows));
+        let map = lab.lost_detail(&coarse);
+        assert_eq!(map.len(), 4 * 3);
+        for (cell, &v) in map.iter().enumerate() {
+            // A double cell loses detail exactly when its four true cells are not all
+            // one colour. (The split is at the midpoint, not at the true cut, so the
+            // value is not the whole loss; it must only be there.)
+            let (cx, cy) = (cell % 4, cell / 4);
+            let quad: Vec<usize> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .iter()
+                .map(|(dx, dy)| truth[(cy * 2 + dy) * 8 + cx * 2 + dx])
+                .collect();
+            let uniform = quad.iter().all(|&t| t == quad[0]);
+            assert_eq!(v == 0, uniform, "cell {cell}: value {v}, true colours {quad:?}");
+        }
+
+        // Noise and soft shading under one just-noticeable difference are not detail.
+        let (soft, _) = synthetic_lattice(&[16; 4], &[16; 4], &DISTINCT_8[..1], false, 3, 5);
+        assert!(LabImage::new(&soft).lost_detail(&grid::even_grid(64, 64, 4, 4)).iter().all(|&v| v == 0));
+
+        // Transparent pixels are not detail.
+        let clear = RgbaImage::from_pixel(32, 32, Rgba([1, 2, 3, 0]));
+        assert!(LabImage::new(&clear).lost_detail(&grid::even_grid(32, 32, 4, 4)).iter().all(|&v| v == 0));
+        // The scale saturates.
+        let mut harsh = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
+        for y in 0..8 {
+            for x in 0..4 {
+                harsh.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        assert_eq!(LabImage::new(&harsh).lost_detail(&grid::even_grid(8, 8, 1, 1)), vec![255]);
+    }
+
+    /// Every candidate carries a map with one value per cell of the very grid it was
+    /// painted on: inside each cell of its cuts, a Blocks result is one colour.
+    #[test]
+    fn the_map_and_the_cuts_describe_the_painted_cells() {
+        let mut rng = ChaCha8Rng::seed_from_u64(17);
+        let cols: Vec<u32> = (0..24).map(|_| rng.gen_range(7..=10)).collect();
+        let rows: Vec<u32> = (0..24).map(|_| rng.gen_range(7..=10)).collect();
+        let (img, _) = synthetic_lattice(&cols, &rows, &DISTINCT_8, true, 4, 18);
+        for fitter in [GridFitter::Walk, GridFitter::Dp] {
+            for vote in [Vote::Majority, Vote::Detail] {
+                let config = Config { vote, ..blocks(fitter) };
+                let candidates = build(&img, &config).unwrap();
+                assert!(candidates.len() >= 3);
+                for c in &candidates {
+                    let g = c.grid.as_ref().unwrap();
+                    assert_eq!(c.lost_detail.len(), g.cell_count());
+                    for row in g.rows.windows(2) {
+                        for col in g.cols.windows(2) {
+                            let first = c.image.get_pixel(col[0] as u32, row[0] as u32);
+                            for y in row[0]..row[1] {
+                                for x in col[0]..col[1] {
+                                    assert_eq!(c.image.get_pixel(x as u32, y as u32), first, "{fitter:?} {vote:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The map is about the image and the grid, not about the vote.
+        let a = build(&img, &blocks(GridFitter::Dp)).unwrap();
+        let b = build(&img, &Config { vote: Vote::Detail, ..blocks(GridFitter::Dp) }).unwrap();
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.lost_detail, y.lost_detail);
+            assert_eq!(x.grid, y.grid);
+        }
+        // Modes without a grid have no map.
+        let smooth = Config { no_resize: true, cleanup: Cleanup::Smooth, ..Default::default() };
+        assert!(build(&img, &smooth).unwrap()[0].lost_detail.is_empty());
+    }
+
+    /// The vote must reach the candidates: on the same grids, the Blocks candidates of
+    /// the detail vote keep a thin feature that those of the majority erase. (A build
+    /// that ignored the vote and always used the majority would pass every other test
+    /// in this file.)
+    #[test]
+    fn blocks_candidates_differ_by_vote_where_it_matters() {
+        let (cols, rows) = ([10u32; 20], [10u32; 20]);
+        let (mut img, _) = synthetic_lattice(&cols, &rows, &DISTINCT_8[1..3], true, 3, 61);
+        // A 3 px dark line, two cells long, through the middle of a column of cells.
+        for y in 90..110 {
+            for x in 103..106 {
+                img.put_pixel(x, y, Rgba([20, 20, 24, 255]));
+            }
+        }
+        let dark = |p: &Rgba<u8>| p[0] < 80 && p[1] < 80 && p[2] < 80;
+        let line_rows = |im: &RgbaImage| {
+            (92..108).filter(|&y| (98..112).any(|x| dark(im.get_pixel(x, y)))).count()
+        };
+        for fitter in [GridFitter::Walk, GridFitter::Dp] {
+            let majority = build(&img, &Config { k_colors: 8, ..blocks(fitter) }).unwrap();
+            let detail = build(&img, &Config { k_colors: 8, vote: Vote::Detail, ..blocks(fitter) }).unwrap();
+            assert_eq!(majority.len(), detail.len());
+            for (m, d) in majority.iter().zip(&detail) {
+                assert_eq!(m.grid, d.grid, "{fitter:?}: the vote must not move the grid");
+            }
+            // At the detected grid (10 px cells) the line is three tenths of a cell.
+            assert_eq!(line_rows(&majority[0].image), 0, "{fitter:?}: the majority kept the line");
+            assert_eq!(line_rows(&detail[0].image), 16, "{fitter:?}: the detail vote lost the line");
+        }
+    }
+
+    /// The map against an independent, naive computation, on awkward cells: odd sizes,
+    /// one pixel wide or tall (one half of the split is empty), single pixels, and
+    /// transparency scattered through.
+    #[test]
+    fn lost_detail_matches_a_naive_computation() {
+        use crate::grid::{LOST_DETAIL_FLOOR, LOST_DETAIL_FULL};
+        let mut rng = ChaCha8Rng::seed_from_u64(23);
+        let (w, h) = (23usize, 17usize);
+        let mut img = RgbaImage::new(w as u32, h as u32);
+        for p in img.pixels_mut() {
+            // Mostly two greys a visible step apart, with noise, so that values land
+            // across the whole scale; one pixel in seven is transparent.
+            let base: i32 = if rng.gen_bool(0.5) { 96 } else { 150 };
+            let v = (base + rng.gen_range(-12..=12)) as u8;
+            *p = Rgba([v, v, v, if rng.gen_ratio(1, 7) { 0 } else { 255 }]);
+        }
+        let grid = Grid {
+            cols: vec![0, 1, 2, 5, 6, 11, 18, 23],
+            rows: vec![0, 1, 4, 5, 10, 17],
+            step: (3.0, 3.0),
+            step_estimated: true,
+        };
+        let got = LabImage::new(&img).lost_detail(&grid);
+
+        // Naive: gather each rectangle's pixels, subtract their mean, sum the squares.
+        let lab = |x: usize, y: usize| {
+            let p = img.get_pixel(x as u32, y as u32);
+            (p[3] != 0).then(|| crate::srgb_to_oklab(p[0], p[1], p[2]))
+        };
+        let scatter = |x0: usize, x1: usize, y0: usize, y1: usize| -> (f64, usize) {
+            let px: Vec<[f32; 3]> = (y0..y1).flat_map(|y| (x0..x1).filter_map(move |x| lab(x, y))).collect();
+            if px.is_empty() {
+                return (0.0, 0);
+            }
+            let mean: Vec<f64> = (0..3).map(|c| px.iter().map(|p| p[c] as f64).sum::<f64>() / px.len() as f64).collect();
+            (px.iter().map(|p| (0..3).map(|c| (p[c] as f64 - mean[c]).powi(2)).sum::<f64>()).sum(), px.len())
+        };
+        let mut want = Vec::new();
+        for r in grid.rows.windows(2) {
+            for c in grid.cols.windows(2) {
+                let (whole, n) = scatter(c[0], c[1], r[0], r[1]);
+                if n == 0 {
+                    want.push(0u8);
+                    continue;
+                }
+                let (mx, my) = ((c[0] + c[1]) / 2, (r[0] + r[1]) / 2);
+                let parts = scatter(c[0], mx, r[0], my).0 + scatter(mx, c[1], r[0], my).0
+                    + scatter(c[0], mx, my, r[1]).0 + scatter(mx, c[1], my, r[1]).0;
+                let gain = ((whole - parts).max(0.0) / n as f64).sqrt() as f32;
+                want.push((255.0 * (gain - LOST_DETAIL_FLOOR) / (LOST_DETAIL_FULL - LOST_DETAIL_FLOOR)).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        assert_eq!(got.len(), want.len());
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!((g as i32 - w as i32).abs() <= 1, "cell {i}: got {g}, naive {w}");
+        }
+        // The fixture really covers the scale: zeros, saturation, and values between.
+        assert!(want.iter().any(|&v| v == 0));
+        assert!(want.iter().any(|&v| v > 20 && v < 235), "{want:?}");
+        // Single pixels and cells with one opaque pixel have nothing to lose.
+        assert_eq!(got[0], 0, "the 1x1 cell");
+
+        // A hand-checked value: half a cell one colour, half another, split down the
+        // middle. One flat colour leaves |A - B| / 2 per pixel; four leave nothing.
+        let (a, b) = ([100u8, 100, 100], [140u8, 140, 140]);
+        let mut halves = RgbaImage::new(6, 4);
+        for (x, _, p) in halves.enumerate_pixels_mut() {
+            let c = if x < 3 { a } else { b };
+            *p = Rgba([c[0], c[1], c[2], 255]);
+        }
+        let (la, lb) = (crate::srgb_to_oklab(a[0], a[1], a[2]), crate::srgb_to_oklab(b[0], b[1], b[2]));
+        let half_step = ((la[0] - lb[0]).powi(2) + (la[1] - lb[1]).powi(2) + (la[2] - lb[2]).powi(2)).sqrt() / 2.0;
+        assert!(half_step > LOST_DETAIL_FLOOR && half_step < LOST_DETAIL_FULL, "{half_step}");
+        let expected = (255.0 * (half_step - LOST_DETAIL_FLOOR) / (LOST_DETAIL_FULL - LOST_DETAIL_FLOOR)).round() as u8;
+        assert_eq!(LabImage::new(&halves).lost_detail(&grid::even_grid(6, 4, 1, 1)), vec![expected]);
+    }
+
+    /// Under the detail vote nothing is the legacy output, and the default vote still is.
+    #[test]
+    fn only_the_majority_vote_can_be_the_legacy_result() {
+        let bytes: &[u8] = include_bytes!("../tests/fixtures/ogtrail_128.png");
+        let detail = Config { vote: Vote::Detail, ..Default::default() };
+        let records = process_candidates_bytes(bytes, &detail).unwrap();
+        assert!(records.iter().all(|r| !r.is_legacy));
+        let legacy = process_image_bytes_common(bytes, None).unwrap();
+        assert!(records.iter().all(|r| r.png != legacy), "the detail vote changed nothing");
+        assert!(records.iter().all(|r| r.lost_detail.len() == (r.cols * r.rows) as usize));
     }
 }

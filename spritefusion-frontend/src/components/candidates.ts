@@ -6,6 +6,10 @@ export interface CandidatesCallbacks {
   onSelect: (index: number) => void;
   /** The user asked for a grid this many cells wide; 0 clears the request. */
   onTargetWidth: (width: number) => void;
+  /** The user chose how cells are coloured: 0 clean (majority), 1 detail. */
+  onVote: (vote: number) => void;
+  /** The user switched the lost-detail overlay on or off. */
+  onOverlay: (on: boolean) => void;
 }
 
 function latticeText(score: number): { text: string; level: string } {
@@ -42,6 +46,16 @@ export function createCandidates(
     <div class="candidates-head">
       <span class="candidates-title">Sizes</span>
       <span class="candidates-lattice"></span>
+      <select class="controls-select candidates-vote"
+        title="How each grid cell gets its colour. Clean takes the colour most of the cell has. Detail lets pixels that differ from their surroundings count for more: it keeps thin lines and small features that Clean erases, and it turns texture into noise.">
+        <option value="0">Cells: Clean</option>
+        <option value="1">Cells: Detail</option>
+      </select>
+      <label class="candidates-overlay"
+        title="Tints the cells where this size is losing detail that a finer size would keep. No tint: nothing more to gain there.">
+        <input type="checkbox" class="controls-checkbox candidates-overlay-toggle" />
+        <span>Show lost detail</span>
+      </label>
       <form class="candidates-width" novalidate>
         <label>
           Add width
@@ -60,6 +74,11 @@ export function createCandidates(
   const form = container.querySelector<HTMLFormElement>('.candidates-width')!;
   const input = container.querySelector<HTMLInputElement>('.candidates-width-input')!;
   const addBtn = container.querySelector<HTMLButtonElement>('.candidates-width-btn')!;
+  const voteSelect = container.querySelector<HTMLSelectElement>('.candidates-vote')!;
+  const overlayToggle = container.querySelector<HTMLInputElement>('.candidates-overlay-toggle')!;
+
+  voteSelect.addEventListener('change', () => callbacks.onVote(parseInt(voteSelect.value, 10)));
+  overlayToggle.addEventListener('change', () => callbacks.onOverlay(overlayToggle.checked));
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -112,6 +131,7 @@ export function createCandidates(
       if (document.activeElement !== input) {
         input.value = target > 0 ? String(target) : '';
       }
+      voteSelect.value = String(set.settings.vote);
 
       strip.replaceChildren(
         ...set.results.map((r, i) => {
@@ -152,6 +172,7 @@ export function createCandidates(
     setProcessing(processing: boolean) {
       input.disabled = processing;
       addBtn.disabled = processing;
+      voteSelect.disabled = processing;
     },
   };
 }

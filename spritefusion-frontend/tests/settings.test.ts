@@ -25,11 +25,13 @@ test('everything that changes the result changes the key', () => {
     { ...base, kColors: 8 },
     { ...base, gridFitter: 1 },
     { ...base, targetWidth: 64 },
+    { ...base, vote: 1 },
     { ...base, noResize: true },
     { ...base, noResize: true, algorithm: 2 },
     { ...base, noResize: true, cleanup: CLEANUP_BLOCKS },
     { ...base, noResize: true, cleanup: CLEANUP_BLOCKS, gridFitter: 1 },
     { ...base, noResize: true, cleanup: CLEANUP_BLOCKS, targetWidth: 64 },
+    { ...base, noResize: true, cleanup: CLEANUP_BLOCKS, vote: 1 },
     { ...base, noResize: true, cleanup: CLEANUP_SMOOTH },
     { ...base, noResize: true, cleanup: CLEANUP_SMOOTH, cleanupStrength: 2 },
     { ...base, noResize: true, cleanup: CLEANUP_SMOOTH, gridFitter: 1 },
@@ -41,12 +43,12 @@ test('everything that changes the result changes the key', () => {
 test('settings with no effect in the current mode share a key', () => {
   const plain = { ...base, noResize: true, cleanup: CLEANUP_OFF };
   // Plain palette reduction uses no grid: fitter and typed width are irrelevant.
-  assert.equal(settingsKey({ ...plain, gridFitter: 1, targetWidth: 99 }), settingsKey(plain));
+  assert.equal(settingsKey({ ...plain, gridFitter: 1, targetWidth: 99, vote: 1 }), settingsKey(plain));
   // Strength belongs to Smooth, typed widths to modes that offer sizes.
   const blocks = { ...base, noResize: true, cleanup: CLEANUP_BLOCKS };
   assert.equal(settingsKey({ ...blocks, cleanupStrength: 3 }), settingsKey(blocks));
   const smooth = { ...base, noResize: true, cleanup: CLEANUP_SMOOTH };
-  assert.equal(settingsKey({ ...smooth, targetWidth: 99 }), settingsKey(smooth));
+  assert.equal(settingsKey({ ...smooth, targetWidth: 99, vote: 1 }), settingsKey(smooth));
 });
 
 test('sizes are offered in snap mode and Blocks only', () => {

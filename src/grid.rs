@@ -221,6 +221,13 @@ fn dp_fit_both_axes(
     (best.1, best.2, best.3)
 }
 
+/// OKLab distance at which the lost-detail map saturates.
+pub const LOST_DETAIL_FULL: f32 = 0.12;
+/// OKLab distance below which the map reads zero: about one just-noticeable difference.
+/// Noise and soft shading inside a cell are not detail anyone would miss, and without
+/// a floor they tint the whole image faintly.
+pub const LOST_DETAIL_FLOOR: f32 = 0.02;
+
 /// A source image in OKLab, converted once. `None` marks fully transparent pixels.
 pub struct LabImage {
     w: usize,
@@ -270,6 +277,56 @@ impl LabImage {
             }
         }
         if count == 0 { 0.0 } else { total / count as f64 }
+    }
+
+    /// **Lost-detail map**: for every cell of `grid` (row-major), how much more of the
+    /// image a 2x2 split of that cell would explain, as 0..=255.
+    ///
+    /// The value is the root of the per-pixel variance that one flat colour leaves
+    /// behind and four would not, in OKLab, scaled so that [`LOST_DETAIL_FLOOR`] is 0
+    /// and [`LOST_DETAIL_FULL`] is 255. Zero means the cell is, to the eye, as flat as
+    /// its quarters: nothing is being lost at this size. A high value means the cell
+    /// holds structure a finer size would keep.
+    pub fn lost_detail(&self, grid: &Grid) -> Vec<u8> {
+        let w = self.w;
+        // Sum of squared distances from the mean of a rectangle, and its pixel count.
+        let sse = |x0: usize, x1: usize, y0: usize, y1: usize| -> (f64, u32) {
+            let (mut sum, mut sq, mut n) = ([0f64; 3], 0f64, 0u32);
+            for y in y0..y1 {
+                for p in self.lab[y * w + x0..y * w + x1].iter().flatten() {
+                    for ch in 0..3 {
+                        sum[ch] += p[ch] as f64;
+                        sq += (p[ch] as f64).powi(2);
+                    }
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return (0.0, 0);
+            }
+            let mean_sq: f64 = sum.iter().map(|s| s * s).sum::<f64>() / n as f64;
+            ((sq - mean_sq).max(0.0), n)
+        };
+
+        let mut map = Vec::with_capacity(grid.cell_count());
+        for row in grid.rows.windows(2) {
+            for col in grid.cols.windows(2) {
+                let (whole, n) = sse(col[0], col[1], row[0], row[1]);
+                if n == 0 {
+                    map.push(0);
+                    continue;
+                }
+                let (mx, my) = ((col[0] + col[1]) / 2, (row[0] + row[1]) / 2);
+                let quarters = sse(col[0], mx, row[0], my).0
+                    + sse(mx, col[1], row[0], my).0
+                    + sse(col[0], mx, my, row[1]).0
+                    + sse(mx, col[1], my, row[1]).0;
+                let gain = ((whole - quarters).max(0.0) / n as f64).sqrt() as f32;
+                let scaled = (gain - LOST_DETAIL_FLOOR) / (LOST_DETAIL_FULL - LOST_DETAIL_FLOOR);
+                map.push((255.0 * scaled).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        map
     }
 
     /// **Lattice score**: is there a pixel grid here, and has `grid` found it?

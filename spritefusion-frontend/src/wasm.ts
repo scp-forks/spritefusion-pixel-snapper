@@ -27,6 +27,14 @@ export interface EngineCandidate {
   latticeScore: number;
   /** Exactly what the original `process_image` returns. */
   isLegacy: boolean;
+  /** The grid's cuts in source pixels; empty when the mode uses no grid. */
+  colCuts: Uint32Array;
+  rowCuts: Uint32Array;
+  /**
+   * One byte per cell, row-major: how much a finer size would add there (0 nothing,
+   * 255 a lot). Empty when the mode uses no grid.
+   */
+  lostDetail: Uint8Array;
 }
 
 /**
@@ -50,6 +58,7 @@ export async function processCandidates(
     opts.cleanup_strength = s.cleanupStrength;
     opts.grid_fitter = s.gridFitter;
     opts.target_width = s.targetWidth;
+    opts.vote = s.vote;
     return process_candidates(bytes, opts).map((c) => {
       // Every getter copies its value out of WASM memory: read each once, then
       // release the object. wasm-bindgen objects are not garbage collected.
@@ -64,6 +73,9 @@ export async function processCandidates(
           gridScale: c.grid_scale,
           latticeScore: c.lattice_score,
           isLegacy: c.is_legacy,
+          colCuts: c.col_cuts,
+          rowCuts: c.row_cuts,
+          lostDetail: c.lost_detail,
         };
       } finally {
         c.free();

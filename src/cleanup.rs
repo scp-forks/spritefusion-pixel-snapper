@@ -37,9 +37,11 @@ pub fn grid_at_scale(base: Grid, profiles: &Profiles, config: &Config, scale: f6
 pub struct BlocksPrep<'a> {
     /// The quantized image as labels, after un-mixing. This is what cells vote on.
     unmixed: IndexedImage<'a>,
-    /// The labels as the quantizer left them, before un-mixing.
-    #[allow(dead_code)] // read by the detail vote
+    /// The labels as the quantizer left them, before un-mixing. The detail vote reads
+    /// these: un-mixing would already have resolved the pixels it wants to hear from.
     raw_labels: Vec<u16>,
+    /// The source in OKLab, row-major.
+    lab: Vec<[f32; 3]>,
     pub profiles: Profiles,
     /// The detected grid, with no cell under 2 px.
     pub base: Grid,
@@ -72,24 +74,33 @@ pub fn prepare_blocks<'a>(
     let pal_lab = palette_oklab(&ix.palette);
     unmix(&mut ix, &lab, &pal_lab, unmix_radius(estimated_pitch(Some(&base))));
 
-    Ok(Some(BlocksPrep { unmixed: ix, raw_labels, profiles, base }))
+    Ok(Some(BlocksPrep { unmixed: ix, raw_labels, lab, profiles, base }))
 }
 
 impl BlocksPrep<'_> {
     /// One colour per cell of `grid`, painted at the original size.
     ///
-    /// * Colour: the majority label among the cell's pixels with `alpha > 0`, counted
-    ///   after un-mixing; ties go to the label that appears first in the image.
+    /// * Colour, `Vote::Majority`: the majority label among the cell's pixels with
+    ///   `alpha > 0`, counted after un-mixing; ties go to the label that appears first
+    ///   in the image. `Vote::Detail`: see [`vote_cells_detail`], on the labels as
+    ///   quantized.
     /// * Alpha: every pixel keeps its own source alpha. Fully transparent pixels are
     ///   copied from the source, so an opaque feature inside a mostly transparent cell
     ///   keeps its shape and takes the cell's colour.
-    pub fn render(&self, grid: &Grid) -> RgbaImage {
+    pub fn render(&self, grid: &Grid, vote: Vote) -> RgbaImage {
+        let labels = match vote {
+            Vote::Majority => self.unmixed.labels.clone(),
+            Vote::Detail => self.raw_labels.clone(),
+        };
         let mut ix = IndexedImage {
             source: self.unmixed.source,
             palette: self.unmixed.palette.clone(),
-            labels: self.unmixed.labels.clone(),
+            labels,
         };
-        let winners = vote_cells(&ix, grid);
+        let winners = match vote {
+            Vote::Majority => vote_cells(&ix, grid),
+            Vote::Detail => vote_cells_detail(&ix, &self.lab, grid),
+        };
         paint_cells(&mut ix, grid, &winners);
         render(&ix)
     }
@@ -102,7 +113,7 @@ pub fn blocks(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Res
         return Ok(Cleaned { image: quantized.clone(), grid: None });
     };
     let grid = crate::candidates::requested_grid(&prep.base, &prep.profiles, source, config)?;
-    Ok(Cleaned { image: prep.render(&grid), grid: Some(grid) })
+    Ok(Cleaned { image: prep.render(&grid, config.vote), grid: Some(grid) })
 }
 
 /// Majority label per cell (row-major over cells), [`TRANSPARENT`] for a cell with no
@@ -500,6 +511,185 @@ pub fn sieve(ix: &mut IndexedImage, lab: &[[f32; 3]], pal_lab: &[[f32; 3]], min_
             return;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The detail vote and the lost-detail map
+// ---------------------------------------------------------------------------
+
+/// How a cell's colour is chosen. Values are part of the WASM and CLI interface.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Vote {
+    /// The colour most of the cell's pixels have. Clean; erases anything thinner
+    /// than half a cell.
+    Majority = 0,
+    /// Pixels vote in proportion to how much they differ from their surroundings, so
+    /// a thin line or a small highlight can win its cell. Keeps detail that Majority
+    /// erases, and turns texture into noise: an alternative, not a default.
+    Detail = 1,
+}
+
+impl Vote {
+    pub fn try_from_u32(v: u32) -> std::result::Result<Self, String> {
+        match v {
+            0 => Ok(Vote::Majority),
+            1 => Ok(Vote::Detail),
+            _ => Err(format!("Invalid vote: {}. Valid values: 0 (Majority), 1 (Detail)", v)),
+        }
+    }
+
+    pub fn from_name(name: &str) -> std::result::Result<Self, String> {
+        match name {
+            "majority" => Ok(Vote::Majority),
+            "detail" => Ok(Vote::Detail),
+            _ => Err(format!("Invalid vote '{}'. Valid values: majority, detail", name)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Vote::Majority => "majority",
+            Vote::Detail => "detail",
+        }
+    }
+}
+
+/// Mean source colour of every cell (row-major), `None` for a cell with no opaque pixel.
+fn cell_means(labels: &[u16], lab: &[[f32; 3]], w: usize, grid: &Grid) -> Vec<Option<[f32; 3]>> {
+    let mut means = Vec::with_capacity(grid.cell_count());
+    for row in grid.rows.windows(2) {
+        for col in grid.cols.windows(2) {
+            let (mut sum, mut n) = ([0f64; 3], 0u32);
+            for y in row[0]..row[1] {
+                for i in y * w + col[0]..y * w + col[1] {
+                    if labels[i] != TRANSPARENT {
+                        for ch in 0..3 {
+                            sum[ch] += lab[i][ch] as f64;
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            means.push((n > 0).then(|| {
+                [(sum[0] / n as f64) as f32, (sum[1] / n as f64) as f32, (sum[2] / n as f64) as f32]
+            }));
+        }
+    }
+    means
+}
+
+/// **Detail vote** (after Weber et al., "Rapid, Detail-Preserving Image Downscaling",
+/// 2016): the label with the greatest total weight wins the cell, where a pixel's
+/// weight is the OKLab distance of its source colour from the local average, and the
+/// local average is the cell means smoothed over 3x3 cells. A pixel that looks like
+/// its surroundings barely votes; one that stands out votes loudly.
+///
+/// Two consequences worth knowing, both measured:
+///
+/// * In a flat neighbourhood the average is the neighbourhood's colour, so almost any
+///   pixel of another colour outweighs the rest of its cell. That is what keeps a
+///   lettering stroke a third of a cell wide, and it is also why texture and leftover
+///   speckle come out as noise. (A weight of distance to the power 0.5 or 0.75 was
+///   tried: it lost the lettering this vote exists to keep.)
+/// * Where neighbouring cells have different colours the average sits between them,
+///   every pixel is far from it, and a thin feature no longer stands out: there this
+///   vote behaves much like the majority.
+///
+/// Ties go to the lowest label. Cells with no opaque pixel get [`TRANSPARENT`].
+pub fn vote_cells_detail(ix: &IndexedImage, lab: &[[f32; 3]], grid: &Grid) -> Vec<u16> {
+    let w = ix.width();
+    let (nx, ny) = (grid.cols.len() - 1, grid.rows.len() - 1);
+    let means = cell_means(&ix.labels, lab, w, grid);
+
+    // 3x3 binomial smoothing of the cell means, over the cells that exist.
+    const KERNEL: [f32; 3] = [1.0, 2.0, 1.0];
+    let smoothed = |cx: usize, cy: usize| -> Option<[f32; 3]> {
+        let (mut sum, mut weight) = ([0f32; 3], 0f32);
+        for (dy, ky) in KERNEL.iter().enumerate() {
+            for (dx, kx) in KERNEL.iter().enumerate() {
+                let (x, y) = (cx as isize + dx as isize - 1, cy as isize + dy as isize - 1);
+                if x < 0 || y < 0 || x >= nx as isize || y >= ny as isize {
+                    continue;
+                }
+                if let Some(m) = means[y as usize * nx + x as usize] {
+                    let k = kx * ky;
+                    for ch in 0..3 {
+                        sum[ch] += k * m[ch];
+                    }
+                    weight += k;
+                }
+            }
+        }
+        (weight > 0.0).then(|| [sum[0] / weight, sum[1] / weight, sum[2] / weight])
+    };
+
+    let mut totals = vec![0f64; ix.palette.len()];
+    let mut seen: Vec<u16> = Vec::new();
+    let mut winners = Vec::with_capacity(grid.cell_count());
+    for (cy, row) in grid.rows.windows(2).enumerate() {
+        for (cx, col) in grid.cols.windows(2).enumerate() {
+            let Some(reference) = smoothed(cx, cy) else {
+                winners.push(TRANSPARENT);
+                continue;
+            };
+            for y in row[0]..row[1] {
+                for i in y * w + col[0]..y * w + col[1] {
+                    let label = ix.labels[i];
+                    if label == TRANSPARENT {
+                        continue;
+                    }
+                    if !seen.contains(&label) {
+                        seen.push(label);
+                    }
+                    // The small constant lets a perfectly flat cell still elect its colour.
+                    totals[label as usize] += dist_sq(&lab[i], &reference).sqrt() as f64 + 1e-6;
+                }
+            }
+            let winner = seen
+                .iter()
+                .copied()
+                .max_by(|&a, &b| {
+                    totals[a as usize]
+                        .partial_cmp(&totals[b as usize])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.cmp(&a))
+                })
+                .unwrap_or(TRANSPARENT);
+            winners.push(winner);
+            for label in seen.drain(..) {
+                totals[label as usize] = 0.0;
+            }
+        }
+    }
+    winners
+}
+
+/// The snap output for the detail vote: one pixel per cell of `grid`, coloured by
+/// [`vote_cells_detail`]. A cell is transparent when fewer than half of its pixels are
+/// opaque, and fully opaque otherwise. (The majority snap output is the legacy
+/// `resample`, which votes on whole RGBA values and is not touched.)
+pub fn resample_detail(source: &RgbaImage, quantized: &RgbaImage, grid: &Grid) -> Result<RgbaImage> {
+    let ix = index_image(source, quantized)?;
+    let lab = source_oklab(source);
+    let winners = vote_cells_detail(&ix, &lab, grid);
+    let w = ix.width();
+    let (nx, ny) = (grid.cols.len() - 1, grid.rows.len() - 1);
+    let mut out = RgbaImage::new(nx as u32, ny as u32);
+    for (cy, row) in grid.rows.windows(2).enumerate() {
+        for (cx, col) in grid.cols.windows(2).enumerate() {
+            let winner = winners[cy * nx + cx];
+            let area = (row[1] - row[0]) * (col[1] - col[0]);
+            let opaque = (row[0]..row[1])
+                .map(|y| ix.labels[y * w + col[0]..y * w + col[1]].iter().filter(|&&l| l != TRANSPARENT).count())
+                .sum::<usize>();
+            if winner != TRANSPARENT && opaque * 2 >= area {
+                let c = ix.palette[winner as usize];
+                out.put_pixel(cx as u32, cy as u32, image::Rgba([c[0], c[1], c[2], 255]));
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1233,5 +1423,220 @@ mod tests {
         };
         let unmixed = regions::image_stats(&run_pipeline(&img, &config).unwrap().image).regions;
         assert!(unmixed < raw, "voting after un-mix left {unmixed} regions, on raw labels {raw}");
+    }
+
+    // ------------------------------------------------------- Detail vote
+
+    /// A light field with a dark vertical line `line_w` px wide starting at `line_x`.
+    fn line_on_field(w: u32, h: u32, line_x: u32, line_w: u32) -> (RgbaImage, Rgba<u8>, Rgba<u8>) {
+        let (field, line) = (Rgba([225, 220, 200, 255]), Rgba([30, 25, 40, 255]));
+        let mut img = RgbaImage::from_pixel(w, h, field);
+        for y in 0..h {
+            for x in line_x..line_x + line_w {
+                img.put_pixel(x, y, line);
+            }
+        }
+        (img, field, line)
+    }
+
+    fn even_cuts(limit: usize, step: usize) -> Vec<usize> {
+        (0..=limit / step).map(|i| i * step).collect()
+    }
+
+    /// A line two fifths of a cell wide: the majority paints it out, the detail vote
+    /// keeps it, because its pixels are the ones that differ from their surroundings.
+    #[test]
+    fn a_thin_line_survives_the_detail_vote_and_not_the_majority() {
+        let (img, field, line) = line_on_field(60, 40, 21, 2);
+        let grid = whole_image_grid(60, 40, even_cuts(60, 5), even_cuts(40, 5));
+        let ix = ix_from(&img);
+        let lab = source_oklab(&img);
+        let line_cell = 4; // columns 20..25
+        let colour = |winners: &[u16], cell: usize| {
+            let c = ix.palette[winners[cell] as usize];
+            Rgba([c[0], c[1], c[2], 255])
+        };
+
+        let majority = vote_cells(&ix, &grid);
+        let detail = vote_cells_detail(&ix, &lab, &grid);
+        for row in 0..8 {
+            let cell = row * 12 + line_cell;
+            assert_eq!(colour(&majority, cell), field, "row {row}: majority should lose the line");
+            assert_eq!(colour(&detail, cell), line, "row {row}: detail should keep the line");
+            // Cells that are all field stay field under both.
+            for other in [0, 3, 5, 11] {
+                assert_eq!(colour(&detail, row * 12 + other), field, "row {row} cell {other}");
+            }
+        }
+    }
+
+    #[test]
+    fn detail_vote_handles_flat_and_empty_cells_and_ties() {
+        // A perfectly flat image: every pixel is exactly the local average, and the
+        // cells must still elect their colour.
+        let flat = RgbaImage::from_pixel(12, 12, Rgba([80, 90, 100, 255]));
+        let grid = whole_image_grid(12, 12, even_cuts(12, 4), even_cuts(12, 4));
+        let ix = ix_from(&flat);
+        assert_eq!(vote_cells_detail(&ix, &source_oklab(&flat), &grid), vec![0; 9]);
+
+        // Cells with nothing opaque have no winner; their neighbours are not disturbed.
+        let mut img = RgbaImage::from_pixel(12, 4, Rgba([0, 0, 0, 0]));
+        for y in 0..4 {
+            for x in 8..12 {
+                img.put_pixel(x, y, Rgba([200, 30, 30, 255]));
+            }
+        }
+        let grid = whole_image_grid(12, 4, even_cuts(12, 4), vec![0, 4]);
+        let ix = ix_from(&img);
+        assert_eq!(vote_cells_detail(&ix, &source_oklab(&img), &grid), vec![TRANSPARENT, TRANSPARENT, 0]);
+
+        // An exact tie goes to the lowest label. The Lab values are given directly
+        // (0.25 and 0.75 are exact in binary, and so is their mean), so that the two
+        // totals are bit-for-bit equal and only the tie-break can decide.
+        let (a, b) = (Rgba([100, 100, 100, 255]), Rgba([140, 140, 140, 255]));
+        for first in [a, b] {
+            let second = if first == a { b } else { a };
+            let mut tie = RgbaImage::new(4, 2);
+            for (x, y, p) in tie.enumerate_pixels_mut() {
+                *p = if (x + y) % 2 == 0 { first } else { second };
+            }
+            let ix = ix_from(&tie);
+            let lab: Vec<[f32; 3]> =
+                ix.labels.iter().map(|&l| [if l == 0 { 0.25 } else { 0.75 }, 0.0, 0.0]).collect();
+            let grid = whole_image_grid(4, 2, vec![0, 4], vec![0, 2]);
+            assert_eq!(vote_cells_detail(&ix, &lab, &grid), vec![0]);
+        }
+        // (A lone cell of two colours is always a tie under this vote, whatever their
+        // shares: the reference is the cell's own mean, and deviations from a mean
+        // balance. It is the neighbouring cells that pull the reference to one side.
+        // Here that is checked with a neighbour: the same cell next to a flat cell of
+        // label 0's colour is won by label 1, the colour that now stands out.)
+        let mut pair = RgbaImage::new(8, 2);
+        for (x, y, p) in pair.enumerate_pixels_mut() {
+            *p = if x >= 4 || (x + y) % 2 == 0 { a } else { b };
+        }
+        let ix = ix_from(&pair);
+        let lab: Vec<[f32; 3]> = ix.labels.iter().map(|&l| [if l == 0 { 0.25 } else { 0.75 }, 0.0, 0.0]).collect();
+        let grid = whole_image_grid(8, 2, vec![0, 4, 8], vec![0, 2]);
+        assert_eq!(vote_cells_detail(&ix, &lab, &grid), vec![1, 0]);
+    }
+
+    /// Through the whole pipeline, in both output kinds, and with the same alpha rules
+    /// as the majority vote. The line runs through cells of two colours, so this also
+    /// covers neighbourhoods that are not flat (where the vote is weaker, see
+    /// `vote_cells_detail`): a line three tenths of a cell wide still wins.
+    #[test]
+    fn detail_vote_end_to_end() {
+        let (cols, rows) = ([10u32; 20], [10u32; 20]);
+        let (mut img, _) = synthetic_lattice(&cols, &rows, &DISTINCT_8[1..3], true, 3, 61);
+        // A 3 px dark line through the middle of a column of 10 px cells. It is short
+        // (two cells of twenty), so that it does not pull the grid onto its own edges:
+        // a line the full height of the image gets cuts of its own, and then even the
+        // majority keeps it.
+        let line_rows = 90u32..110;
+        for y in line_rows.clone() {
+            for x in 103..106 {
+                img.put_pixel(x, y, Rgba([20, 20, 24, 255]));
+            }
+        }
+        let dark = |p: &Rgba<u8>| p[0] < 80 && p[1] < 80 && p[2] < 80;
+        // Share of the line's rows (scaled to the image's height) that show it.
+        let rows_with_line = |im: &RgbaImage, x0: u32, x1: u32| {
+            let scale = im.height() as f64 / 200.0;
+            let (y0, y1) = ((92.0 * scale).ceil() as u32, (108.0 * scale).floor() as u32);
+            (y0..y1).filter(|&y| (x0..x1).any(|x| dark(im.get_pixel(x, y)))).count() as f64
+                / (y1 - y0) as f64
+        };
+
+        for fitter in [crate::grid::GridFitter::Walk, crate::grid::GridFitter::Dp] {
+            let blocks = |vote| {
+                let config = Config { vote, grid_fitter: fitter, ..blocks_config(8, 1.0) };
+                run_pipeline(&img, &config).unwrap().image
+            };
+            let (majority, detail) = (blocks(Vote::Majority), blocks(Vote::Detail));
+            assert!(rows_with_line(&majority, 98, 112) < 0.2, "{fitter:?}: majority kept the line");
+            assert!(rows_with_line(&detail, 98, 112) > 0.9, "{fitter:?}: detail lost the line");
+            assert_eq!(detail.dimensions(), img.dimensions());
+
+        }
+
+        // The small snap output, on a known grid. (Not through grid detection: the
+        // legacy walker moves its cuts onto the line for some palettes, and then the
+        // line has cells of its own and every vote keeps it.)
+        let (field_img, field, line) = line_on_field(60, 40, 21, 2);
+        let grid = whole_image_grid(60, 40, even_cuts(60, 5), even_cuts(40, 5));
+        let majority = crate::candidates::snap_image(&field_img, &field_img, &grid, Vote::Majority).unwrap();
+        let detail = crate::candidates::snap_image(&field_img, &field_img, &grid, Vote::Detail).unwrap();
+        assert_eq!((majority.dimensions(), detail.dimensions()), ((12, 8), (12, 8)));
+        for (x, y, p) in detail.enumerate_pixels() {
+            assert_eq!(*majority.get_pixel(x, y), field, "snap majority kept the line at ({x},{y})");
+            assert_eq!(*p, if x == 4 { line } else { field }, "snap detail at ({x},{y})");
+        }
+
+        // Alpha: Blocks keeps every pixel's own alpha under either vote.
+        let sprite = sprite_with_alpha();
+        let out = run_pipeline(&sprite, &Config { vote: Vote::Detail, ..blocks_config(8, 1.0) }).unwrap().image;
+        for (src, dst) in sprite.pixels().zip(out.pixels()) {
+            assert_eq!(src[3], dst[3]);
+            if src[3] == 0 {
+                assert_eq!(src, dst);
+            }
+        }
+        assert_eq!(out, run_pipeline(&sprite, &Config { vote: Vote::Detail, ..blocks_config(8, 1.0) }).unwrap().image);
+    }
+
+    /// The snap output of the detail vote is opaque exactly when at least half of the
+    /// cell's pixels have any alpha at all, and then fully opaque.
+    #[test]
+    fn snap_detail_alpha_is_decided_at_half_the_cell() {
+        let (red, clear) = (Rgba([200, 30, 30, 255]), Rgba([9, 9, 9, 0]));
+        let solid = Rgba([200, 30, 30, 255]);
+        let none = Rgba([0, 0, 0, 0]);
+
+        // 4x4 cells with 16, 6, 7, 8, 9 and 10 of 16 pixels opaque.
+        let counts = [16u32, 6, 7, 8, 9, 10];
+        let mut img = RgbaImage::from_pixel(4 * counts.len() as u32, 4, clear);
+        for (cell, &n) in counts.iter().enumerate() {
+            for i in 0..n {
+                img.put_pixel(cell as u32 * 4 + i % 4, i / 4, red);
+            }
+        }
+        let cols: Vec<usize> = (0..=counts.len()).map(|i| i * 4).collect();
+        let grid = whole_image_grid(img.width() as usize, 4, cols, vec![0, 4]);
+        let out = resample_detail(&img, &img, &grid).unwrap();
+        assert_eq!(out.dimensions(), (counts.len() as u32, 1));
+        for (cell, &n) in counts.iter().enumerate() {
+            let want = if n >= 8 { solid } else { none };
+            assert_eq!(*out.get_pixel(cell as u32, 0), want, "{n} of 16 opaque");
+        }
+
+        // An odd area: 3x3 cells with 4 and 5 of 9 opaque (half is 4.5).
+        let mut odd = RgbaImage::from_pixel(6, 3, clear);
+        for (cell, n) in [(0u32, 4u32), (1, 5)] {
+            for i in 0..n {
+                odd.put_pixel(cell * 3 + i % 3, i / 3, red);
+            }
+        }
+        let grid = whole_image_grid(6, 3, vec![0, 3, 6], vec![0, 3]);
+        let out = resample_detail(&odd, &odd, &grid).unwrap();
+        assert_eq!((*out.get_pixel(0, 0), *out.get_pixel(1, 0)), (none, solid));
+
+        // Faint pixels count as present, and the output alpha is still 255, not theirs.
+        let mut faint = RgbaImage::from_pixel(4, 4, clear);
+        for i in 0..8u32 {
+            faint.put_pixel(i % 4, i / 4, Rgba([200, 30, 30, if i % 2 == 0 { 1 } else { 128 }]));
+        }
+        let grid = whole_image_grid(4, 4, vec![0, 4], vec![0, 4]);
+        assert_eq!(*resample_detail(&faint, &faint, &grid).unwrap().get_pixel(0, 0), solid);
+    }
+
+    #[test]
+    fn vote_names_round_trip() {
+        for vote in [Vote::Majority, Vote::Detail] {
+            assert_eq!(Vote::from_name(vote.name()), Ok(vote));
+            assert_eq!(Vote::try_from_u32(vote as u32), Ok(vote));
+        }
+        assert!(Vote::try_from_u32(2).is_err());
+        assert!(Vote::from_name("Detail").is_err());
     }
 }

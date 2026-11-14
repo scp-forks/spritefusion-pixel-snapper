@@ -14,6 +14,11 @@ export interface CachedResult {
   gridScale: number;
   /** Exactly what the original engine returns for this image. */
   isLegacy: boolean;
+  /** The grid's cuts in source pixels; empty when the mode uses no grid. */
+  colCuts: Uint32Array;
+  rowCuts: Uint32Array;
+  /** One byte per cell, row-major: how much a finer size would add there. */
+  lostDetail: Uint8Array;
 }
 
 /** Everything one engine run produced: one result, or several sizes to choose from. */
@@ -33,7 +38,11 @@ export const MAX_ENTRIES = 48;
 export const MAX_BYTES = 128 * 1024 * 1024;
 
 function sizeOf(set: ResultSet): number {
-  return set.results.reduce((sum, r) => sum + r.bytes.length, 0);
+  return set.results.reduce(
+    (sum, r) =>
+      sum + r.bytes.length + r.lostDetail.length + 4 * (r.colCuts.length + r.rowCuts.length),
+    0,
+  );
 }
 
 export function createResultCache() {

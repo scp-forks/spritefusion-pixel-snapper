@@ -57,6 +57,10 @@ ladder() { # ladder <image> <extra args...>
     ladder "$image" --grid-fitter=dp
     ladder "$image" --no-resize --cleanup=blocks
     ladder "$image" --no-resize --cleanup=blocks --grid-fitter=dp
+    ladder "$image" --vote=detail
+    ladder "$image" --no-resize --cleanup=blocks --vote=detail
+    run "$image" --vote=detail
+    run "$image" --no-resize --cleanup=blocks --vote=detail
   done
 } > "$OUT/current.jsonl"
 

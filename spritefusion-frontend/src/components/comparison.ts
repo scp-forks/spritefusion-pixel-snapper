@@ -1,9 +1,12 @@
+import { rasterizeOverlay, type OverlayMap } from '../overlay';
+
 export function createComparison(container: HTMLElement) {
   container.innerHTML = `
     <div class="comparison-wrapper">
       <img class="comparison-original" alt="Original" />
       <div class="comparison-clip">
         <img class="comparison-processed" alt="Processed" />
+        <canvas class="comparison-overlay hidden"></canvas>
       </div>
       <div class="comparison-divider">
         <div class="comparison-handle"></div>
@@ -18,6 +21,7 @@ export function createComparison(container: HTMLElement) {
   const originalImg = container.querySelector<HTMLImageElement>('.comparison-original')!;
   const processedImg = container.querySelector<HTMLImageElement>('.comparison-processed')!;
   const clipDiv = container.querySelector<HTMLDivElement>('.comparison-clip')!;
+  const overlay = container.querySelector<HTMLCanvasElement>('.comparison-overlay')!;
   const divider = container.querySelector<HTMLDivElement>('.comparison-divider')!;
   const toggleBtn = container.querySelector<HTMLButtonElement>('.comparison-size-toggle')!;
 
@@ -28,6 +32,7 @@ export function createComparison(container: HTMLElement) {
     divider.style.left = `${pct}%`;
     clipDiv.style.width = `${100 - pct}%`;
     processedImg.style.width = `${wrapper.offsetWidth}px`;
+    overlay.style.width = `${wrapper.offsetWidth}px`;
   }
 
   function applyMode() {
@@ -100,6 +105,22 @@ export function createComparison(container: HTMLElement) {
     updateProcessed(processedUrl: string) {
       processedImg.src = processedUrl;
       processedImg.onload = () => applyMode();
+    },
+
+    /**
+     * Tint the processed image by a per-cell map, or clear the tint with `null`.
+     *
+     * The canvas has the pixel size of the processed image and is laid out exactly
+     * like it; `rasterizeOverlay` paints each cell where the engine painted it.
+     */
+    setOverlay(map: OverlayMap | null) {
+      overlay.classList.toggle('hidden', !map);
+      if (!map) return;
+      overlay.width = map.width;
+      overlay.height = map.height;
+      const image = new ImageData(map.width, map.height);
+      image.data.set(rasterizeOverlay(map));
+      overlay.getContext('2d')!.putImageData(image, 0, 0);
     },
   };
 }

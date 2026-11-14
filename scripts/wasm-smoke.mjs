@@ -86,8 +86,8 @@ function run(configure) {
 {
   const opts = new pkg.ProcessOptions();
   assert.deepEqual(
-    [opts.k_colors, opts.no_resize, opts.algorithm, opts.cleanup, opts.cleanup_strength, opts.grid_scale, opts.grid_fitter, opts.target_width],
-    [16, false, 0, 0, 1, 1, 0, 0],
+    [opts.k_colors, opts.no_resize, opts.algorithm, opts.cleanup, opts.cleanup_strength, opts.grid_scale, opts.grid_fitter, opts.target_width, opts.vote],
+    [16, false, 0, 0, 1, 1, 0, 0, 0],
   );
   opts.free();
 }
@@ -143,7 +143,7 @@ function candidates(configure) {
         png: c.png, width: c.width, height: c.height, uniqueColors: c.unique_colors,
         cols: c.cols, rows: c.rows,
         gridScale: c.grid_scale, latticeScore: c.lattice_score, isLegacy: c.is_legacy,
-        colCuts: c.col_cuts, rowCuts: c.row_cuts,
+        colCuts: c.col_cuts, rowCuts: c.row_cuts, lostDetail: c.lost_detail,
       };
       c.free();
       return copy;
@@ -165,6 +165,8 @@ function candidates(configure) {
     assert.deepEqual([c.width, c.height], [c.cols, c.rows], 'snap output is one pixel per cell');
     assert.equal(c.colCuts.length, c.cols + 1);
     assert.equal(c.rowCuts.length, c.rows + 1);
+    assert.ok(c.lostDetail instanceof Uint8Array);
+    assert.equal(c.lostDetail.length, c.cols * c.rows, 'one lost-detail value per cell');
     assert.deepEqual([c.colCuts[0], c.colCuts.at(-1), c.rowCuts.at(-1)], [0, 128, 128]);
     assert.equal(c.latticeScore, snap[0].latticeScore);
     if (i > 0) assert.ok(c.cols * c.rows > snap[i - 1].cols * snap[i - 1].rows, 'coarsest first');
@@ -176,6 +178,19 @@ function candidates(configure) {
     assert.deepEqual(pngSize(c.png), [128, 128]);
     assert.ok(c.cols > 0 && !c.isLegacy);
   }
+  // The coarsest size loses detail somewhere; and on the whole no less than the finest.
+  const lost = (c) => c.lostDetail.reduce((a, b) => a + b, 0) / c.lostDetail.length;
+  assert.ok(snap[0].lostDetail.some((v) => v > 0), 'the coarsest size loses nothing?');
+  assert.ok(lost(snap[0]) >= lost(snap.at(-1)), `${lost(snap[0])} < ${lost(snap.at(-1))}`);
+  // The detail vote: same sizes, same maps, different pictures, never the legacy one.
+  const detail = candidates((o) => { o.vote = 1; });
+  assert.deepEqual(detail.map((c) => [c.cols, c.rows]), snap.map((c) => [c.cols, c.rows]));
+  assert.ok(detail.every((c) => !c.isLegacy));
+  assert.ok(detail.some((c, i) => Buffer.compare(c.png, snap[i].png) !== 0), 'the detail vote changed nothing');
+  detail.forEach((c, i) => assert.deepEqual([...c.lostDetail], [...snap[i].lostDetail]));
+  const blocksDetail = candidates((o) => { o.no_resize = true; o.cleanup = 1; o.vote = 1; });
+  for (const c of blocksDetail) assert.deepEqual(pngSize(c.png), [128, 128]);
+  assert.throws(() => candidates((o) => { o.vote = 2; }), /vote/i);
   // A typed width adds a rung near it; a width needing cells under 2 px is refused.
   const typed = candidates((o) => { o.target_width = 40; });
   assert.ok(typed.some((c) => Math.abs(c.cols - 40) <= 4), `no rung near 40: ${typed.map((c) => c.cols)}`);
@@ -185,7 +200,7 @@ function candidates(configure) {
   for (const cleanup of [0, 2]) {
     const one = candidates((o) => { o.no_resize = true; o.cleanup = cleanup; });
     assert.equal(one.length, 1);
-    assert.deepEqual([one[0].cols, one[0].rows, one[0].colCuts.length], [0, 0, 0]);
+    assert.deepEqual([one[0].cols, one[0].rows, one[0].colCuts.length, one[0].lostDetail.length], [0, 0, 0, 0]);
     assert.deepEqual([...one[0].png], [...run((o) => { o.no_resize = true; o.cleanup = cleanup; })]);
   }
   // In the single-result call a typed width takes the place of the grid scale.
