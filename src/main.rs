@@ -53,6 +53,9 @@ pub enum Cleanup {
     Off = 0,
     /// One colour per grid cell, painted back at the original size.
     Blocks = 1,
+    /// Blend pixels resolved to neighbouring flat colours, tiny regions merged into
+    /// their most similar neighbour. Keeps soft shading; needs no grid.
+    Smooth = 2,
 }
 
 impl Cleanup {
@@ -60,7 +63,11 @@ impl Cleanup {
         match v {
             0 => Ok(Cleanup::Off),
             1 => Ok(Cleanup::Blocks),
-            _ => Err(format!("Invalid cleanup ID: {}. Valid values: 0 (Off), 1 (Blocks)", v)),
+            2 => Ok(Cleanup::Smooth),
+            _ => Err(format!(
+                "Invalid cleanup ID: {}. Valid values: 0 (Off), 1 (Blocks), 2 (Smooth)",
+                v
+            )),
         }
     }
 
@@ -68,7 +75,8 @@ impl Cleanup {
         match name {
             "off" => Ok(Cleanup::Off),
             "blocks" => Ok(Cleanup::Blocks),
-            _ => Err(format!("Invalid cleanup '{}'. Valid values: off, blocks", name)),
+            "smooth" => Ok(Cleanup::Smooth),
+            _ => Err(format!("Invalid cleanup '{}'. Valid values: off, blocks, smooth", name)),
         }
     }
 
@@ -76,6 +84,7 @@ impl Cleanup {
         match self {
             Cleanup::Off => "off",
             Cleanup::Blocks => "blocks",
+            Cleanup::Smooth => "smooth",
         }
     }
 }
@@ -119,6 +128,8 @@ pub struct Config {
     algorithm: QuantAlgorithm,
     /// No-resize mode only. See [`Cleanup`].
     cleanup: Cleanup,
+    /// How much `Cleanup::Smooth` may remove.
+    cleanup_strength: cleanup::Strength,
     /// How many times finer than the detected grid to work, 1.0 = as detected.
     /// Applies to the snap output and to `Cleanup::Blocks`.
     grid_scale: f64,
@@ -146,6 +157,7 @@ impl Default for Config {
             no_resize: false,
             algorithm: QuantAlgorithm::KMeansPerceptual,
             cleanup: Cleanup::Off,
+            cleanup_strength: cleanup::Strength::Light,
             grid_scale: 1.0,
             print_stats: false,
         }
@@ -280,6 +292,10 @@ fn run_pipeline(rgba_img: &RgbaImage, config: &Config) -> Result<PipelineOutput>
                 let cleaned = cleanup::blocks(rgba_img, &quantized, config)?;
                 Ok(PipelineOutput { image: cleaned.image, grid: cleaned.grid })
             }
+            Cleanup::Smooth => {
+                let cleaned = cleanup::smooth(rgba_img, &quantized, config)?;
+                Ok(PipelineOutput { image: cleaned.image, grid: cleaned.grid })
+            }
         }
     } else {
         if config.cleanup != Cleanup::Off {
@@ -349,11 +365,13 @@ fn config_from_options(
     no_resize: bool,
     algorithm: f64,
     cleanup: f64,
+    cleanup_strength: f64,
     grid_scale: f64,
 ) -> std::result::Result<Config, String> {
     let k_colors = checked_u32("k_colors", k_colors)?;
     let algorithm = checked_u32("algorithm", algorithm)?;
     let cleanup = checked_u32("cleanup", cleanup)?;
+    let cleanup_strength = checked_u32("cleanup_strength", cleanup_strength)?;
     if k_colors == 0 {
         return Err("k_colors must be greater than 0".to_string());
     }
@@ -369,6 +387,7 @@ fn config_from_options(
         no_resize,
         algorithm: QuantAlgorithm::try_from_u32(algorithm)?,
         cleanup,
+        cleanup_strength: cleanup::Strength::try_from_u32(cleanup_strength)?,
         grid_scale: validate_grid_scale(grid_scale)?,
         ..Default::default()
     })
@@ -388,8 +407,11 @@ pub struct ProcessOptions {
     pub no_resize: bool,
     /// Quantizer for no-resize mode, 0-5. Default 0 (k-means, perceptual).
     pub algorithm: f64,
-    /// No-resize only. 0 = off, 1 = blocks (one colour per grid cell). Default 0.
+    /// No-resize only. 0 = off, 1 = blocks (one colour per grid cell), 2 = smooth
+    /// (resolve blends, merge tiny regions). Default 0.
     pub cleanup: f64,
+    /// For cleanup 2: 1 = light, 2 = medium, 3 = strong. Default 1.
+    pub cleanup_strength: f64,
     /// Work on a grid this many times finer than the detected one, 1 to 16. Default 1.
     pub grid_scale: f64,
 }
@@ -404,6 +426,7 @@ impl ProcessOptions {
             no_resize: false,
             algorithm: 0.0,
             cleanup: 0.0,
+            cleanup_strength: 1.0,
             grid_scale: 1.0,
         }
     }
@@ -422,6 +445,7 @@ pub fn process_image_with(
         opts.no_resize,
         opts.algorithm,
         opts.cleanup,
+        opts.cleanup_strength,
         opts.grid_scale,
     )
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
@@ -505,8 +529,8 @@ fn parse_args() -> Option<Config> {
         }
     }
 
-    // Optional flags: --no-resize, --algorithm=<0-5>, --cleanup=off|blocks,
-    //                 --grid-scale=<1..16>, --stats
+    // Optional flags: --no-resize, --algorithm=<0-5>, --cleanup=off|blocks|smooth,
+    //                 --strength=light|medium|strong, --grid-scale=<1..16>, --stats
     // Algorithm IDs: 0=K-Means Perceptual, 1=Median Cut, 2=Wu's Optimal,
     //                3=Spatial, 4=Grey Wolf, 5=Differentiable Palette
     for arg in args.iter().skip(3) {
@@ -517,6 +541,11 @@ fn parse_args() -> Option<Config> {
         } else if let Some(name) = arg.strip_prefix("--cleanup=") {
             match Cleanup::from_name(name) {
                 Ok(cleanup) => config.cleanup = cleanup,
+                Err(e) => eprintln!("Warning: {}", e),
+            }
+        } else if let Some(name) = arg.strip_prefix("--strength=") {
+            match cleanup::Strength::from_name(name) {
+                Ok(strength) => config.cleanup_strength = strength,
                 Err(e) => eprintln!("Warning: {}", e),
             }
         } else if let Some(scale_str) = arg.strip_prefix("--grid-scale=") {
@@ -592,12 +621,13 @@ fn stats_json(
         None => "null".to_string(),
     };
     format!(
-        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"cleanup\":\"{}\",\"grid_scale\":{},\"grid\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
+        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"cleanup\":\"{}\",\"strength\":\"{}\",\"grid_scale\":{},\"grid\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
         input_name,
         if config.no_resize { "no-resize" } else { "snap" },
         config.k_colors,
         config.algorithm as u32,
         config.cleanup.name(),
+        config.cleanup_strength.name(),
         config.grid_scale,
         grid,
         stats.width,
@@ -3547,25 +3577,31 @@ mod tests {
 
     #[test]
     fn options_are_validated_not_clamped() {
-        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0).unwrap();
+        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0, 2.0).unwrap();
         assert_eq!(ok.k_colors, 8);
         assert!(ok.no_resize);
         assert_eq!(ok.algorithm, QuantAlgorithm::SpatialQuantization);
         assert_eq!(ok.cleanup, Cleanup::Blocks);
+        assert_eq!(ok.cleanup_strength, cleanup::Strength::Medium);
         assert_eq!(ok.grid_scale, 2.0);
+        assert_eq!(config_from_options(8.0, true, 0.0, 2.0, 3.0, 1.0).unwrap().cleanup, Cleanup::Smooth);
 
-        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0).is_err(), "zero colours");
-        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0).is_err(), "unknown algorithm");
-        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0).is_err(), "unknown cleanup");
-        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0).is_err(), "cleanup without no_resize");
+        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0, 1.0).is_err(), "zero colours");
+        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0, 1.0).is_err(), "unknown algorithm");
+        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0, 1.0).is_err(), "unknown cleanup");
+        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0, 1.0).is_err(), "cleanup without no_resize");
+        assert!(config_from_options(16.0, false, 0.0, 2.0, 1.0, 1.0).is_err(), "smooth without no_resize");
+        for strength in [0.0, 4.0, 1.5, f64::NAN] {
+            assert!(config_from_options(16.0, true, 0.0, 2.0, strength, 1.0).is_err(), "strength {strength}");
+        }
         for scale in [0.0, 0.99, 16.5, -2.0, f64::NAN, f64::INFINITY] {
-            assert!(config_from_options(16.0, true, 0.0, 0.0, scale).is_err(), "grid scale {scale}");
+            assert!(config_from_options(16.0, true, 0.0, 0.0, 1.0, scale).is_err(), "grid scale {scale}");
         }
         // What `>>> 0` would have turned into something valid.
         for bad in [f64::NAN, f64::INFINITY, -1.0, 1.5, 4294967296.0, 4294967312.0] {
-            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0).is_err(), "k_colors {bad}");
-            assert!(config_from_options(16.0, true, bad, 0.0, 1.0).is_err(), "algorithm {bad}");
-            assert!(config_from_options(16.0, true, 0.0, bad, 1.0).is_err(), "cleanup {bad}");
+            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0, 1.0).is_err(), "k_colors {bad}");
+            assert!(config_from_options(16.0, true, bad, 0.0, 1.0, 1.0).is_err(), "algorithm {bad}");
+            assert!(config_from_options(16.0, true, 0.0, bad, 1.0, 1.0).is_err(), "cleanup {bad}");
         }
         assert_eq!(checked_u32("x", 4294967295.0), Ok(u32::MAX));
         assert_eq!(checked_u32("x", 0.0), Ok(0));
@@ -3574,7 +3610,7 @@ mod tests {
     /// `process_image_with` with default options must be the legacy snap output.
     #[test]
     fn default_options_reproduce_the_legacy_output() {
-        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0).unwrap();
+        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0).unwrap();
         for (name, bytes, golden) in golden_fixtures() {
             let png = process_image_bytes_common(bytes, Some(config.clone())).unwrap();
             assert_eq!(fnv1a(&png), golden.png, "fixture {name}");
@@ -3624,10 +3660,10 @@ mod tests {
         };
         assert_eq!(
             stats_json(&config, &stats, None),
-            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"cleanup":"off","grid_scale":1,"grid":null,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
+            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"cleanup":"off","strength":"light","grid_scale":1,"grid":null,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
         );
         let blocks = Config { cleanup: Cleanup::Blocks, grid_scale: 1.5, ..config };
         assert!(stats_json(&blocks, &stats, Some((12, 9)))
-            .contains(r#""cleanup":"blocks","grid_scale":1.5,"grid":[12,9],"#));
+            .contains(r#""cleanup":"blocks","strength":"light","grid_scale":1.5,"grid":[12,9],"#));
     }
 }

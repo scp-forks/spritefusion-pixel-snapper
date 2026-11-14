@@ -39,6 +39,9 @@ run() { # run <image> <extra args...>
     run "$image" --grid-scale=2
     run "$image" --no-resize --cleanup=blocks
     run "$image" --no-resize --cleanup=blocks --grid-scale=2
+    for strength in light medium strong; do
+      run "$image" --no-resize --cleanup=smooth "--strength=$strength"
+    done
   done
 } > "$OUT/current.jsonl"
 

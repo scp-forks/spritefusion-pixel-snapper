@@ -86,8 +86,8 @@ function run(configure) {
 {
   const opts = new pkg.ProcessOptions();
   assert.deepEqual(
-    [opts.k_colors, opts.no_resize, opts.algorithm, opts.cleanup, opts.grid_scale],
-    [16, false, 0, 0, 1],
+    [opts.k_colors, opts.no_resize, opts.algorithm, opts.cleanup, opts.cleanup_strength, opts.grid_scale],
+    [16, false, 0, 0, 1, 1],
   );
   opts.free();
 }
@@ -112,6 +112,17 @@ const plain = run((o) => { o.no_resize = true; });
 const blocks = run((o) => { o.no_resize = true; o.cleanup = 1; });
 assert.notDeepEqual([...blocks], [...plain], 'Blocks returned the plain reduction');
 
+// 4b. So does Smooth, differently at each strength, and it keeps the size.
+const smooth = [1, 2, 3].map((strength) =>
+  run((o) => { o.no_resize = true; o.cleanup = 2; o.cleanup_strength = strength; }),
+);
+for (const out of smooth) {
+  assert.deepEqual(pngSize(out), [128, 128]);
+  assert.notDeepEqual([...out], [...plain], 'Smooth returned the plain reduction');
+  assert.notDeepEqual([...out], [...blocks], 'Smooth returned the Blocks result');
+}
+assert.notDeepEqual([...smooth[0]], [...smooth[2]], 'Light and Strong gave the same result');
+
 // 5. A finer grid in snap mode gives a larger output.
 const [w2, h2] = pngSize(run((o) => { o.grid_scale = 2; }));
 assert.ok(w2 > 27 && h2 > 28, `grid_scale=2 gave ${w2}x${h2}`);
@@ -124,6 +135,10 @@ const invalid = [
   [(o) => { o.no_resize = true; o.algorithm = 9; }, /algorithm/i],
   [(o) => { o.no_resize = true; o.cleanup = 7; }, /cleanup/i],
   [(o) => { o.cleanup = 1; }, /no_resize/],
+  [(o) => { o.cleanup = 2; }, /no_resize/],
+  [(o) => { o.no_resize = true; o.cleanup = 2; o.cleanup_strength = 0; }, /strength/i],
+  [(o) => { o.no_resize = true; o.cleanup = 2; o.cleanup_strength = 4; }, /strength/i],
+  [(o) => { o.no_resize = true; o.cleanup = 2; o.cleanup_strength = 1.5; }, /strength/i],
   [(o) => { o.grid_scale = 0.5; }, /grid scale/i],
   [(o) => { o.grid_scale = Number.NaN; }, /grid scale/i],
   [(o) => { o.grid_scale = Infinity; }, /grid scale/i],

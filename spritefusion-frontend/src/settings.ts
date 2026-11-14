@@ -7,20 +7,26 @@ export interface ProcessSettings {
   algorithm: number;
   /** Spatial cleanup after palette reduction. Only used in no-resize mode. */
   cleanup: number;
+  /** How much Smooth may remove: 1 light, 2 medium, 3 strong. Only used by Smooth. */
+  cleanupStrength: number;
   /** How many times finer than the detected grid to work. Only used by Blocks. */
   gridScale: number;
 }
 
 export const CLEANUP_OFF = 0;
 export const CLEANUP_BLOCKS = 1;
+export const CLEANUP_SMOOTH = 2;
 
-export const CLEANUP_NAMES = ['Off', 'Blocks'];
+export const CLEANUP_NAMES = ['Off', 'Blocks', 'Smooth'];
+export const STRENGTH_LIGHT = 1;
+export const STRENGTH_NAMES = ['', 'light', 'medium', 'strong'];
 
 export const DEFAULT_SETTINGS: ProcessSettings = {
   kColors: 16,
   noResize: false,
   algorithm: 0,
   cleanup: CLEANUP_OFF,
+  cleanupStrength: STRENGTH_LIGHT,
   gridScale: 1,
 };
 
@@ -31,18 +37,25 @@ export const DEFAULT_SETTINGS: ProcessSettings = {
  */
 export function effectiveSettings(s: ProcessSettings): ProcessSettings {
   if (!s.noResize) {
-    return { ...s, algorithm: 0, cleanup: CLEANUP_OFF, gridScale: 1 };
+    return {
+      ...s,
+      algorithm: 0,
+      cleanup: CLEANUP_OFF,
+      cleanupStrength: STRENGTH_LIGHT,
+      gridScale: 1,
+    };
   }
-  if (s.cleanup !== CLEANUP_BLOCKS) {
-    return { ...s, gridScale: 1 };
-  }
-  return { ...s };
+  return {
+    ...s,
+    cleanupStrength: s.cleanup === CLEANUP_SMOOTH ? s.cleanupStrength : STRENGTH_LIGHT,
+    gridScale: s.cleanup === CLEANUP_BLOCKS ? s.gridScale : 1,
+  };
 }
 
 /** Cache identity of a result: equal keys mean byte-identical output. */
 export function settingsKey(s: ProcessSettings): string {
   const e = effectiveSettings(s);
   return e.noResize
-    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.gridScale}`
+    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridScale}`
     : `snap:${e.kColors}`;
 }

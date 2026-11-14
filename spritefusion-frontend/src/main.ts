@@ -94,6 +94,9 @@ const controls = createControls(controlsEl, {
   onCleanupChange: (cleanup) => {
     state.settings.cleanup = cleanup;
   },
+  onCleanupStrengthChange: (strength) => {
+    state.settings.cleanupStrength = strength;
+  },
   onGridScaleChange: (gridScale) => {
     state.settings.gridScale = gridScale;
   },
@@ -160,6 +163,7 @@ function renderStats() {
     noResize: entry.settings.noResize,
     algorithm: entry.settings.algorithm,
     cleanup: entry.settings.cleanup,
+    cleanupStrength: entry.settings.cleanupStrength,
     gridScale: entry.settings.gridScale,
   });
 }

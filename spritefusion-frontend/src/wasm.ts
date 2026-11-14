@@ -28,6 +28,7 @@ export async function processImage(
     opts.no_resize = s.noResize;
     opts.algorithm = s.algorithm;
     opts.cleanup = s.cleanup;
+    opts.cleanup_strength = s.cleanupStrength;
     opts.grid_scale = s.gridScale;
     return process_image_with(bytes, opts);
   } finally {

@@ -1,4 +1,9 @@
-import { CLEANUP_BLOCKS, CLEANUP_NAMES } from '../settings';
+import {
+  CLEANUP_BLOCKS,
+  CLEANUP_NAMES,
+  CLEANUP_SMOOTH,
+  STRENGTH_NAMES,
+} from '../settings';
 
 export interface StatsData {
   originalWidth: number;
@@ -11,6 +16,7 @@ export interface StatsData {
   noResize: boolean;
   algorithm: number;
   cleanup: number;
+  cleanupStrength: number;
   gridScale: number;
 }
 
@@ -40,10 +46,12 @@ export function createStats(container: HTMLElement) {
         const cleanupName = CLEANUP_NAMES[data.cleanup] ?? 'Off';
         // The engine falls back to a coarser grid when cells would go under 2 px, and
         // does not report which grid it used, so this is what was asked for.
-        const cleanupValue =
-          data.cleanup === CLEANUP_BLOCKS && data.gridScale !== 1
-            ? `${cleanupName}, ${data.gridScale}x finer grid requested`
-            : cleanupName;
+        let cleanupValue = cleanupName;
+        if (data.cleanup === CLEANUP_BLOCKS && data.gridScale !== 1) {
+          cleanupValue = `${cleanupName}, ${data.gridScale}x finer grid requested`;
+        } else if (data.cleanup === CLEANUP_SMOOTH) {
+          cleanupValue = `${cleanupName}, ${STRENGTH_NAMES[data.cleanupStrength] ?? 'light'}`;
+        }
         thirdGroup = `
           <div class="stat-group">
             <span class="stat-group-label">Mode</span>

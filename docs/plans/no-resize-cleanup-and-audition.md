@@ -480,3 +480,55 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
   mattered: Blocks voted on the detected grid's 1 px cells (a 1 px checkerboard came back
   untouched), and invalid JS numbers were coerced into valid options before validation.
 
+### Phase 3 — done
+
+- `cleanup.rs`: `smooth`, `unmix`, `sieve`, `Strength`, `sieve_min_area`, `unmix_radius`.
+  CLI `--cleanup=smooth`, `--strength=light|medium|strong`; `ProcessOptions.cleanup_strength`
+  (1–3); a Strength select in the app, shown only for Smooth. Blocks now un-mixes before
+  it votes.
+- Regions under 16 px at 16 colours, k-means, measured from a fresh build of the final code:
+
+  | image | plain | Light (< 4 px removed) | Medium (< 8) | Strong (< 16) |
+  |---|---|---|---|---|
+  | wolf | 26 399 | 2 932 | 853 | 0 |
+  | coliseum | 17 045 | 1 355 | 286 | 0 |
+  | ogtrail | 9 963 | 2 529 | 869 | 0 |
+  | city | 34 565 | 6 698 | 2 500 | 0 |
+  | sprite sheet | 24 227 | 7 261 | 2 675 | 0 |
+  | cat | 185 376 | 22 955 | 6 105 | 0 |
+
+  Nothing under 4 px survives any strength. 0.13–0.78 s per image natively. The wolf's
+  ear outline is intact at all three.
+- **The "done when" is not met as written, and was the wrong test.** It asked for under
+  2 % of the wolf's small regions at Medium (528); the result is 853 (3.2 %). Medium is
+  defined as removing regions under 8 px, and those 853 are all 8–15 px. The 2 % came
+  from the research prototype, which reached it by removing things it should not have
+  (next two points). What is now promised and tested: at each strength, nothing under
+  that strength's threshold survives; Strong leaves nothing under 16 px.
+- **Flaw 1 in the research's sieve, found by the outline test.** On an outline made of a
+  perfect checkerboard of two near-blacks the sequential sieve never converged: each
+  pixel merged into its still-unprocessed neighbour, so the checkerboard inverted every
+  pass while the grey beside it ate in one column at a time until the outline was gone.
+  Fix: a small region that an earlier merge in the same pass has just joined is left for
+  the next pass, when the two are measured as one region.
+- **Flaw 2, in the research's un-mix, found by Codex.** "Take the nearest label that any
+  nearby flat area has" also repaints small features that have no flat interior of their
+  own: the outline's outer columns, a 2×2 highlight. Fix: a pixel is re-labelled only if
+  its source colour is a blend, within 0.05 OKLab of the line between two colours carried
+  by nearby flat pixels. This is why the research found un-mix "fusing a small dark
+  feature with a dark neighbour" (E14).
+- Un-mixing before the vote still helps Blocks: wolf 68 → 51 regions under 16 px at
+  scale 1 and 2 707 → 2 018 at scale 2; coliseum at scale 2, 85 → 53.
+- Deviations from the plan:
+  - The un-mix reach is `clamp(round(pitch / 3), 1, 3) + 1`, or 2 with no pitch. The
+    extra pixel is needed because a blend must see flat pixels on both sides, and a flat
+    pixel is at least one pixel away from any ramp. The 8 px gate applies only to the
+    cell-relative sieve thresholds.
+  - The sieve runs up to 32 passes, not 6.
+  - Smooth reports no grid in `--stats` even when one was detected for its pitch.
+  - Keeping the raw label map next to the un-mixed one is deferred to Phase 6, which is
+    the first reader of it.
+- A mistake of mine, caught by Codex: the first version of the table above was measured
+  with a CLI binary that predated the sieve fix (`cargo test` does not rebuild it), and
+  disagreed with the corpus baseline. All figures here are from a fresh build.
+- Codex review (`docs/reviews/phase-3-review.md`): four findings, three fixed, one deferred.

@@ -93,7 +93,8 @@ Optional flags after the color count:
 |---|---|
 | `--no-resize` | Keep the original dimensions; reduce the palette only |
 | `--algorithm=<0-5>` | Quantizer for `--no-resize`: 0 K-Means (perceptual), 1 Median Cut, 2 Wu, 3 Spatial, 4 Grey Wolf, 5 Differentiable |
-| `--cleanup=off\|blocks` | With `--no-resize`: `blocks` gives every detected grid cell one color, painted at the original size. Removes the speckle that palette reduction leaves on blurry pixel art |
+| `--cleanup=off\|blocks\|smooth` | With `--no-resize`: removes the speckle that palette reduction leaves on blurry pixel art. `blocks` gives every detected grid cell one color, painted at the original size. `smooth` keeps soft shading and needs no grid: blended edges resolve to one of the two colors they lie between, and tiny regions merge into their most similar neighbor. Both flatten intentional dithering |
+| `--strength=light\|medium\|strong` | For `--cleanup=smooth`: remove regions under 4, 8 or 16 px (more on coarse grids). Default `light` |
 | `--grid-scale=<1-16>` | Work on a grid this many times finer than the detected one. Use 1.5, 2 or 3 when details are being lost. Applies to the snapped output and to `--cleanup=blocks`. Cells are never smaller than 2 px |
 | `--stats` | Print one JSON line describing the output: size, grid, color count, and how many same-color regions are under 4 px and under 16 px |
 
@@ -131,7 +132,8 @@ const opts = new ProcessOptions(); // a plain object literal is not accepted
 opts.k_colors = 16;
 opts.no_resize = true;  // keep the original dimensions
 opts.algorithm = 0;     // 0-5, as for the CLI
-opts.cleanup = 1;       // 0 off, 1 blocks
+opts.cleanup = 1;       // 0 off, 1 blocks, 2 smooth
+opts.cleanup_strength = 1; // for smooth: 1 light, 2 medium, 3 strong
 opts.grid_scale = 2;    // 1 to 16
 try {
   const outputPng = process_image_with(inputBytes, opts);
