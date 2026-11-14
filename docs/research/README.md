@@ -15,6 +15,10 @@ Read in this order:
 | [`figures/`](figures/) | Comparison crops (`fig*.png`, panels left to right as named) and full-size results (`full/`) |
 | [`experiments/`](experiments/) | Prototype code; `run_all.sh` reproduces every number |
 
+The implementation plan that follows from this research is
+[`../plans/no-resize-cleanup-and-audition.md`](../plans/no-resize-cleanup-and-audition.md),
+with Codex's review of it in [`../reviews/`](../reviews/no-resize-cleanup-and-audition-review.md).
+
 Figures worth opening first:
 
 - `figures/fig1_orig_vs_baseline.png` — the problem.

@@ -19,7 +19,8 @@ isometric city). Statements that changed are marked *(revised)*. The changes in 
 - Pitch estimation is less solved than round one implied. Autocorrelation failed on two
   of the three new images, and the shipping estimator lands between block sizes on ogtrail.
 - Some AI "pixel art" mixes block sizes (ogtrail), and some inputs have no lattice at
-  all (city). How far a fitted grid beats an even one (36 %, 23 %, 11 %, 2 %) measures this.
+  all (city). The lattice score (fitted grid against deliberately unaligned grids) orders
+  them: 0.52, 0.38, 0.24 for the three real lattices, 0.10 ogtrail, 0.09 city, 0.02 cat.
 - The detail-weighted vote does promote noise in textured areas. It stays a flavour.
 
 ## The short version
@@ -84,7 +85,9 @@ that algorithm and not of algorithm 3 in this repo, which is k-means with a
 neighbour-agreement bonus. Codex found that its labels are discarded at output; using them
 removes 97 % of fragments (E12). Same name, different algorithms.
 
-**Potts/ICM cleanup.** Codex ranks an edge-weighted Potts cleanup highly. Measured, ICM is
+**Potts/ICM cleanup.** Codex ranks an edge-weighted Potts cleanup highly. What was measured
+is a constant-weight version, not the edge-weighted one Codex proposed, so this is not a
+refutation of its proposal. Measured, that ICM is
 the gentlest cleanup but a weak optimiser: at a safe λ it leaves a sixth to a third of the
 fragments and is the slowest option tried (E3). A component sieve removes the rest in a
 fraction of the time. **Resolution:** sieve first; Potts only if the sieve proves too
@@ -113,7 +116,7 @@ Two families fix it, and they look different:
 | Fragments left (coliseum) | 0 at native, 208 at ×2 | 0 |
 | Wolf *(second batch)* | clean at 199×200; equals the shipping snap painted back at full size | clean, keeps the soft shading; needs the colour-aware sieve |
 | Fails when | the grid is wrong or too coarse; anything thinner than a cell is voted away | small features next to a similar region get fused; never becomes blocky |
-| Use for | images where a fitted grid clearly beats an even one | images with no lattice (the cat, the city), or as a pre-pass before voting |
+| Use for | images with a clear lattice score (≳ 0.2 on six images) | images with no lattice (the cat, the city), or as a pre-pass before voting |
 
 They combine: un-mixing first and then voting gave the cleanest ×2 result (208 fragments
 against 637 for voting on raw labels).
@@ -210,6 +213,10 @@ as a style.
 
 ## Proposed build order
 
+**Superseded by `docs/plans/no-resize-cleanup-and-audition.md`**, which turns this table into
+phases with tests and has been reviewed by Codex (`docs/reviews/no-resize-cleanup-and-audition-review.md`).
+The table is kept as the research's original recommendation.
+
 Smallest and most certain first. Each step is independently shippable.
 
 | # | Step | Why here | Size |
@@ -217,10 +224,10 @@ Smallest and most certain first. Each step is independently shippable.
 | 0 | Use the Spatial quantizer's own labels at output; investigate Grey Wolf's 5-colour collapse | Bugs; step 0a is two lines and removes 97 % of fragments for that algorithm | tiny |
 | 1 | Separate palette, label map, grid and rendering in `main.rs` (Codex §9.1) | Every later step needs to mix and match these | medium |
 | 2 | **Snap in place** for no-resize: existing grid → cell vote → paint original rectangles, with a grid-scale control (native / ×1.5 / ×2 / ×3, down to ≈ 2 px cells) | The main fix for A; mostly existing code | small |
-| 3 | Replace `walk()` with a bounded DP (with a per-cut cost, see 04); profiles in OKLab instead of luma; report how far the fit beats an even grid | 29–35 % better fit on the coliseum, no change on the clean one. Pitch *estimation* is a separate, less solved problem: keep the shipping estimator until something beats it on a real corpus | medium |
+| 3 | Replace `walk()` with a bounded DP (with a per-cut cost, see 04); profiles in OKLab instead of luma; report the lattice score | 29–35 % better fit on the coliseum, no change on the clean one. Pitch *estimation* is a separate, less solved problem: keep the shipping estimator until something beats it on a real corpus | medium |
 | 4 | Cell-first colour: vote on structure labels, colour from interior pixels carrying the winning label, palette fitted on cells | Stops accent colours being lost and fringe colours taking palette slots | medium |
 | 5 | Audition ladder in WASM + UI: candidates, clean/detail flavours, scores, lost-detail overlay | Problem B; the result cache already keys on settings | medium–large |
-| 6 | Smooth mode: un-mix + **colour-aware** sieve with a strength control, offered when the fitted grid barely beats an even one | Covers non-lattice inputs and "keep the shading" on real pixel art | small–medium |
+| 6 | Smooth mode: un-mix + **colour-aware** sieve with a strength control, offered when the lattice score is low | Covers non-lattice inputs and "keep the shading" on real pixel art | small–medium |
 | 7 | Evaluation harness: synthetic damage of true pixel art (pixel-bench style) plus the metrics in `experiments/lab.py` | Makes thresholds tunable on more than three images | medium |
 | 8 | Per-band columns, then estimated mesh; asset-aware splitting for sprite sheets | Problem C, only after 2–5 expose real failures | large |
 
@@ -237,7 +244,8 @@ pixels. The numpy prototypes run each stage in 0.1–1 s unoptimised.
 | Can intentional dithering be protected? | Images with ordered and irregular dither; measure false deletion and false protection separately |
 | ~~Is the detail-weighted vote promoting noise elsewhere in the frame?~~ Answered: yes, on textured facades in the city (`fig18`) | Remaining: can it be limited to isolated features? |
 | How often is the native grid one octave too coarse? | Run the ladder on a corpus and record which rung a human picks |
-| Does a lattice measure separate real cases? | Six images now: fitted-vs-even gain of 36 %, 23 %, 11 %, 2 %, 2 %. The middle is where the decision is hard |
+| Does the lattice score separate real cases? | Six images now: 0.52, 0.38, 0.24, 0.10, 0.09, 0.02. ogtrail (mixed blocks) and the city (no grid) are 0.01 apart |
+| Would an edge-weighted Potts cleanup beat the sieve? | Only a constant-weight ICM was tested (`lab.potts_icm`). Compare matched cleanup strength against outline preservation, with Rust timings |
 | How should pitch be estimated on mixed-block images? | Per-region estimates are too noisy at 4×4 tiles (E17); try larger overlapping windows and a robust "finest well-supported" rule |
 | Does a 16-colour palette starve small saturated regions (ogtrail's vest and hair)? | Compare pixel-weighted and region-weighted palette fitting at fixed k |
 | Is drift non-separable often enough to justify a mesh? | Compare global, banded and tile-estimated fits on more images |

@@ -24,7 +24,7 @@ All runs use k-means perceptual, 16 colours, as in round one.
 | Un-mix + dissolve small regions is the safe grid-free cleanup | **The dissolve step was defective**: it erased the wolf's ear outline. Fixed with a colour-aware version (below). Un-mix itself does little when blocks are small |
 | Autocorrelation finds the pitch | **Wrong on two of three new images.** Replaced with a score-per-pitch sweep (E15) |
 | The elastic grid fit is strictly better | It over-segments soft lattices (235 columns on the wolf where ≈ 200 is right). Fixed with a per-cut cost |
-| A lattice score near zero flags "not pixel art" | The gap is narrower than three images suggested: 0.10 (cat), 0.19 (city), 0.23 (ogtrail), 0.30 (wolf) |
+| A lattice score near zero flags "not pixel art" | Holds, with a narrower gap than three images suggested: 0.02 (cat), 0.09 (city), 0.10 (ogtrail), 0.24 (wolf), 0.38, 0.52 |
 | Tiling adds no detail capacity | **Holds**, and the city shows it directly. One new use for regions: block size really does differ by region on ogtrail |
 
 ## E15 — Finding the pitch: a score per candidate pitch
@@ -77,10 +77,28 @@ on an average column earns nothing) gives:
 Round-one coliseum numbers were produced without the cut cost and are left as they
 were; the difference is 0.0189 against 0.0192.
 
-The last column is the useful one. How much a fitted grid beats an even grid with the
-same number of cells says how much lattice there is to recover: 36 % on the coliseum,
-23 % on the wolf, 11 % on ogtrail at 5.3 px, 2 % on ogtrail at 2 px and on the city at
-2 px.
+The last column says how much a fitted grid beats an even grid with the same number of
+cells: 36 % on the coliseum, 23 % on the wolf, 11 % on ogtrail at 5.3 px, 2 % on ogtrail
+at 2 px and on the city at 2 px, and **0 % on the sprite sheet**.
+
+That last value matters. This number measures how *irregular* the lattice is, that is,
+how much fitting is worth. It does not measure whether a lattice exists: a perfectly
+regular one is matched by an even grid and scores zero. (An earlier draft of this file
+called it the measure of "is this pixel art". Codex's plan review caught the error.)
+The measure of whether a lattice exists is the lattice score of E9, which compares the
+fitted grid with deliberately *unaligned* even grids at 0.8× and 1.25× its pitch:
+
+| image (pitch) | lattice score | gain over an even grid, same cell count |
+|---|---|---|
+| sprite sheet (4) | 0.52 | 0.00 |
+| coliseum (9.3) | 0.38 | 0.36 |
+| wolf (5) | 0.24 | 0.23 |
+| ogtrail (5.3 / 3.4) | 0.10 / 0.11 | 0.11 / 0.12 |
+| city (2.8 / 4.5) | 0.09 / 0.05 | 0.09 / 0.05 |
+| cat (8) | 0.02 | 0.00 |
+
+The lattice score orders all six the way a person would. ogtrail and the city are close
+(0.10 against 0.09), so it does not cleanly separate "mixed blocks" from "no grid".
 
 ## E16 — The pipeline on the three images
 
@@ -238,10 +256,12 @@ substantial part of the image supports, not the global median), not for processi
    mixes block sizes. City: there is no grid to estimate. This is the strongest evidence
    so far for an audition ladder, and it says the ladder must reach well below the
    estimate, not stop at ×2.
-2. **How far the fitted grid beats an even one is the measure of "is this pixel art".**
-   36 %, 23 %, 11 %, 2 %. When it is small, snap in place still works as a clean
-   downscale-and-repaint, but calling it grid recovery is wrong and the result should
-   not be expected to look hand-pixelled.
+2. **The lattice score says whether there is a grid to recover**: 0.52, 0.38, 0.24 on
+   the three real lattices, 0.10 on ogtrail, 0.09 on the city, 0.02 on the cat. When it
+   is low, snap in place still works as a clean downscale-and-repaint, but calling it
+   grid recovery is wrong and the result should not be expected to look hand-pixelled.
+   How far the fitted grid beats an even one is a different number (how irregular the
+   lattice is) and is zero on the cleanest image.
 3. **The grid-free cleanup needs the colour-aware sieve.** The round-one sieve should
    not be built.
 4. **On non-lattice images, small regions are mostly detail.** No size threshold
