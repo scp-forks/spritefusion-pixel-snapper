@@ -8,9 +8,10 @@
 # Also builds the WASM package and runs scripts/wasm-smoke.mjs when wasm-pack and node
 # are installed.
 #
-# Each line is the CLI's --stats output for one image in one mode: output size, number
-# of colours, and how many 4-connected same-colour regions are under 4 px and under
-# 16 px (the speckle counts). Lines carry no paths or timings.
+# Each line is the CLI's --stats output for one image in one mode: output size, the
+# grid and how well it explains the source (residual), number of colours, and how many
+# 4-connected same-colour regions are under 4 px and under 16 px (the speckle counts).
+# Lines carry no paths or timings.
 #
 # The baseline was recorded on macOS/arm64. The OKLab quantizers use cbrt and powf, so
 # another platform's libm may move a handful of pixels; treat small differences in the
@@ -42,6 +43,9 @@ run() { # run <image> <extra args...>
     for strength in light medium strong; do
       run "$image" --no-resize --cleanup=smooth "--strength=$strength"
     done
+    run "$image" --grid-fitter=dp
+    run "$image" --grid-fitter=dp --grid-scale=2
+    run "$image" --grid-fitter=dp --no-resize --cleanup=blocks
   done
 } > "$OUT/current.jsonl"
 

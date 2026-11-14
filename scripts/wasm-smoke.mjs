@@ -86,8 +86,8 @@ function run(configure) {
 {
   const opts = new pkg.ProcessOptions();
   assert.deepEqual(
-    [opts.k_colors, opts.no_resize, opts.algorithm, opts.cleanup, opts.cleanup_strength, opts.grid_scale],
-    [16, false, 0, 0, 1, 1],
+    [opts.k_colors, opts.no_resize, opts.algorithm, opts.cleanup, opts.cleanup_strength, opts.grid_scale, opts.grid_fitter],
+    [16, false, 0, 0, 1, 1, 0],
   );
   opts.free();
 }
@@ -123,6 +123,16 @@ for (const out of smooth) {
 }
 assert.notDeepEqual([...smooth[0]], [...smooth[2]], 'Light and Strong gave the same result');
 
+// 4c. The elastic fitter is opt-in: it gives a different snap result, and works in
+//     every mode that uses a grid.
+const elastic = run((o) => { o.grid_fitter = 1; });
+pngSize(elastic);
+assert.notDeepEqual([...elastic], [...legacy], 'grid_fitter=1 returned the legacy result');
+for (const cleanup of [1, 2]) {
+  const out = run((o) => { o.no_resize = true; o.cleanup = cleanup; o.grid_fitter = 1; });
+  assert.deepEqual(pngSize(out), [128, 128]);
+}
+
 // 5. A finer grid in snap mode gives a larger output.
 const [w2, h2] = pngSize(run((o) => { o.grid_scale = 2; }));
 assert.ok(w2 > 27 && h2 > 28, `grid_scale=2 gave ${w2}x${h2}`);
@@ -142,6 +152,8 @@ const invalid = [
   [(o) => { o.grid_scale = 0.5; }, /grid scale/i],
   [(o) => { o.grid_scale = Number.NaN; }, /grid scale/i],
   [(o) => { o.grid_scale = Infinity; }, /grid scale/i],
+  [(o) => { o.grid_fitter = 2; }, /grid fitter/i],
+  [(o) => { o.grid_fitter = 0.5; }, /grid_fitter/],
 ];
 for (const bad of [Number.NaN, Infinity, -1, 1.5, 2 ** 32, 2 ** 32 + 16]) {
   invalid.push([(o) => { o.k_colors = bad; }, /k_colors/]);

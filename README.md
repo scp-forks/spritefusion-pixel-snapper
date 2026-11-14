@@ -96,6 +96,7 @@ Optional flags after the color count:
 | `--cleanup=off\|blocks\|smooth` | With `--no-resize`: removes the speckle that palette reduction leaves on blurry pixel art. `blocks` gives every detected grid cell one color, painted at the original size. `smooth` keeps soft shading and needs no grid: blended edges resolve to one of the two colors they lie between, and tiny regions merge into their most similar neighbor. Both flatten intentional dithering |
 | `--strength=light\|medium\|strong` | For `--cleanup=smooth`: remove regions under 4, 8 or 16 px (more on coarse grids). Default `light` |
 | `--grid-scale=<1-16>` | Work on a grid this many times finer than the detected one. Use 1.5, 2 or 3 when details are being lost. Applies to the snapped output and to `--cleanup=blocks`. Cells are never smaller than 2 px |
+| `--grid-fitter=walk\|dp` | How the pixel grid is found. `walk` is the original and the default. `dp` fits the grid to edges in the source image with a globally optimal elastic fit: it handles perfectly crisp (nearest-neighbor upscaled) pixel art, which `walk` cannot measure, and places cell borders more exactly. Experimental; it changes the snapped output |
 | `--stats` | Print one JSON line describing the output: size, grid, color count, and how many same-color regions are under 4 px and under 16 px |
 
 ```bash
@@ -135,6 +136,7 @@ opts.algorithm = 0;     // 0-5, as for the CLI
 opts.cleanup = 1;       // 0 off, 1 blocks, 2 smooth
 opts.cleanup_strength = 1; // for smooth: 1 light, 2 medium, 3 strong
 opts.grid_scale = 2;    // 1 to 16
+opts.grid_fitter = 0;   // 0 original walker, 1 elastic fit (experimental)
 try {
   const outputPng = process_image_with(inputBytes, opts);
 } finally {

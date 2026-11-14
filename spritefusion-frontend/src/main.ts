@@ -100,6 +100,9 @@ const controls = createControls(controlsEl, {
   onGridScaleChange: (gridScale) => {
     state.settings.gridScale = gridScale;
   },
+  onGridFitterChange: (gridFitter) => {
+    state.settings.gridFitter = gridFitter;
+  },
 });
 
 const comparison = createComparison(comparisonEl);

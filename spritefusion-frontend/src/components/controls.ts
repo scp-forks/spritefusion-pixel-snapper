@@ -1,4 +1,4 @@
-import { CLEANUP_BLOCKS, CLEANUP_SMOOTH } from '../settings';
+import { CLEANUP_BLOCKS, CLEANUP_OFF, CLEANUP_SMOOTH } from '../settings';
 
 export interface ControlsCallbacks {
   onProcess: () => void;
@@ -8,6 +8,7 @@ export interface ControlsCallbacks {
   onCleanupChange: (cleanup: number) => void;
   onCleanupStrengthChange: (strength: number) => void;
   onGridScaleChange: (gridScale: number) => void;
+  onGridFitterChange: (gridFitter: number) => void;
 }
 
 export function createControls(
@@ -53,6 +54,11 @@ export function createControls(
         <option value="2">Grid: 2x finer</option>
         <option value="3">Grid: 3x finer</option>
       </select>
+      <select class="controls-select controls-grid-fitter"
+        title="How the pixel grid is found. Standard is the original method. Elastic fits the grid to edges in the source image: it handles perfectly crisp pixel art, which Standard cannot measure, and places cell borders more exactly. It changes the result, so it is opt-in.">
+        <option value="0">Grid fit: Standard</option>
+        <option value="1">Grid fit: Elastic (beta)</option>
+      </select>
     </div>
     <button class="controls-btn" type="button">
       <span class="btn-text">Process</span>
@@ -67,6 +73,7 @@ export function createControls(
   const cleanupSelect = container.querySelector<HTMLSelectElement>('.controls-cleanup')!;
   const gridScaleSelect = container.querySelector<HTMLSelectElement>('.controls-grid-scale')!;
   const strengthSelect = container.querySelector<HTMLSelectElement>('.controls-strength')!;
+  const gridFitterSelect = container.querySelector<HTMLSelectElement>('.controls-grid-fitter')!;
 
   // Each control is shown only where it has an effect.
   function syncVisibility() {
@@ -76,6 +83,8 @@ export function createControls(
     cleanupSelect.classList.toggle('hidden', !noResize);
     gridScaleSelect.classList.toggle('hidden', !(noResize && cleanup === CLEANUP_BLOCKS));
     strengthSelect.classList.toggle('hidden', !(noResize && cleanup === CLEANUP_SMOOTH));
+    // Plain palette reduction is the one mode that uses no grid.
+    gridFitterSelect.classList.toggle('hidden', noResize && cleanup === CLEANUP_OFF);
   }
   const btn = container.querySelector<HTMLButtonElement>('.controls-btn')!;
   const btnText = btn.querySelector<HTMLSpanElement>('.btn-text')!;
@@ -134,6 +143,11 @@ export function createControls(
     scheduleProcess();
   });
 
+  gridFitterSelect.addEventListener('change', () => {
+    callbacks.onGridFitterChange(parseInt(gridFitterSelect.value, 10));
+    scheduleProcess();
+  });
+
   gridScaleSelect.addEventListener('change', () => {
     callbacks.onGridScaleChange(parseFloat(gridScaleSelect.value));
     scheduleProcess();
@@ -158,6 +172,7 @@ export function createControls(
       cleanupSelect.disabled = processing;
       gridScaleSelect.disabled = processing;
       strengthSelect.disabled = processing;
+      gridFitterSelect.disabled = processing;
       btnText.textContent = processing ? 'Processing...' : 'Process';
       btnSpinner.classList.toggle('hidden', !processing);
     },

@@ -114,7 +114,15 @@ The shipping snap pipeline returns 188×100 for this image, which is the native 
 and is exactly the "too aggressive" result: `figures/fig4_*` shows windows and lines
 being wiped out at that resolution.
 
-### An elastic comb fit beats the greedy walker and beats any uniform grid
+### An elastic comb fit beats any uniform grid
+
+**Correction (Phase 4 of the implementation).** This section was first headed "beats the
+greedy walker", and the synthesis repeated it as "29–35 % better fit". The table below
+never measured the walker: both comparisons are against *uniform* grids. Measured later
+in Rust on the same image, the shipping walker's grid has a residual of 0.0214 and the
+elastic fit 0.0195, which is 9 % better, not 35 %. The elastic fit's real advantages
+turned out to be elsewhere: it measures crisp pixel art, which the walker's estimator
+cannot, and it puts cuts on the edges instead of one pixel early.
 
 `cuts_dp` in `lab.py` is a Viterbi (dynamic-programming) version of the walker: choose
 all cuts at once to maximise edge strength under the cuts, with each step constrained

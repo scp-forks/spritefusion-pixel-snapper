@@ -11,6 +11,11 @@ export interface ProcessSettings {
   cleanupStrength: number;
   /** How many times finer than the detected grid to work. Only used by Blocks. */
   gridScale: number;
+  /**
+   * How the pixel grid is found: 0 the original walker, 1 the elastic fit on the
+   * source image. Used wherever a grid is: snap mode, Blocks, and Smooth's scale.
+   */
+  gridFitter: number;
 }
 
 export const CLEANUP_OFF = 0;
@@ -19,6 +24,8 @@ export const CLEANUP_SMOOTH = 2;
 
 export const CLEANUP_NAMES = ['Off', 'Blocks', 'Smooth'];
 export const STRENGTH_LIGHT = 1;
+export const FITTER_WALK = 0;
+export const FITTER_NAMES = ['Standard', 'Elastic'];
 export const STRENGTH_NAMES = ['', 'light', 'medium', 'strong'];
 
 export const DEFAULT_SETTINGS: ProcessSettings = {
@@ -28,6 +35,7 @@ export const DEFAULT_SETTINGS: ProcessSettings = {
   cleanup: CLEANUP_OFF,
   cleanupStrength: STRENGTH_LIGHT,
   gridScale: 1,
+  gridFitter: FITTER_WALK,
 };
 
 /**
@@ -49,6 +57,8 @@ export function effectiveSettings(s: ProcessSettings): ProcessSettings {
     ...s,
     cleanupStrength: s.cleanup === CLEANUP_SMOOTH ? s.cleanupStrength : STRENGTH_LIGHT,
     gridScale: s.cleanup === CLEANUP_BLOCKS ? s.gridScale : 1,
+    // Plain palette reduction uses no grid at all.
+    gridFitter: s.cleanup === CLEANUP_OFF ? FITTER_WALK : s.gridFitter,
   };
 }
 
@@ -56,6 +66,6 @@ export function effectiveSettings(s: ProcessSettings): ProcessSettings {
 export function settingsKey(s: ProcessSettings): string {
   const e = effectiveSettings(s);
   return e.noResize
-    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridScale}`
-    : `snap:${e.kColors}`;
+    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridScale}:${e.gridFitter}`
+    : `snap:${e.kColors}:${e.gridFitter}`;
 }

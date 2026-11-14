@@ -133,6 +133,8 @@ pub struct Config {
     /// How many times finer than the detected grid to work, 1.0 = as detected.
     /// Applies to the snap output and to `Cleanup::Blocks`.
     grid_scale: f64,
+    /// How the pixel grid is found. `Walk` is the original and the default.
+    grid_fitter: grid::GridFitter,
     /// CLI only: print one JSON line of output statistics after saving.
     #[allow(dead_code)]
     print_stats: bool,
@@ -159,6 +161,7 @@ impl Default for Config {
             cleanup: Cleanup::Off,
             cleanup_strength: cleanup::Strength::Light,
             grid_scale: 1.0,
+            grid_fitter: grid::GridFitter::Walk,
             print_stats: false,
         }
     }
@@ -307,19 +310,29 @@ fn run_pipeline(rgba_img: &RgbaImage, config: &Config) -> Result<PipelineOutput>
         // Legacy pipeline: RGB k-means quantize + grid detection + resampling. With
         // grid_scale == 1 this is byte-identical to what it has always produced.
         let quantized_img = quantize_image(rgba_img, config)?;
-        let base = grid::detect_grid(&quantized_img, config)?;
-        let grid = cleanup::grid_at_scale(base, &quantized_img, config, config.grid_scale);
+        let profiles = grid::profiles(rgba_img, &quantized_img, config)?;
+        let base = grid::detect(&profiles, rgba_img.width(), rgba_img.height(), config)?;
+        let grid = cleanup::grid_at_scale(base, &profiles, config, config.grid_scale);
         let image = resample(&quantized_img, &grid.cols, &grid.rows)?;
         Ok(PipelineOutput { image, grid: Some(grid) })
     }
 }
 
-/// Decode, process, encode as PNG. Also returns the grid size (columns, rows) when the
-/// output was built on one.
+/// What `--stats` reports about the grid an output was built on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridReport {
+    cols: usize,
+    rows: usize,
+    /// `grid::residual` of the source on this grid. Only computed for `--stats`.
+    residual: Option<f64>,
+}
+
+/// Decode, process, encode as PNG. Also reports the grid when the output was built
+/// on one.
 fn process_image_bytes_detailed(
     input_bytes: &[u8],
     config: &Config,
-) -> Result<(Vec<u8>, Option<(usize, usize)>)> {
+) -> Result<(Vec<u8>, Option<GridReport>)> {
     let img = image::load_from_memory(input_bytes)?;
     let (width, height) = img.dimensions();
 
@@ -335,8 +348,12 @@ fn process_image_bytes_detailed(
         .write_to(&mut cursor, image::ImageFormat::Png)
         .map_err(|e| PixelSnapperError::ImageError(e))?;
 
-    let grid_size = output.grid.map(|g| (g.cols.len() - 1, g.rows.len() - 1));
-    Ok((output_bytes, grid_size))
+    let report = output.grid.map(|g| GridReport {
+        cols: g.cols.len() - 1,
+        rows: g.rows.len() - 1,
+        residual: config.print_stats.then(|| grid::residual(&rgba_img, &g)),
+    });
+    Ok((output_bytes, report))
 }
 
 #[allow(dead_code)] // WASM entry points and tests
@@ -367,11 +384,13 @@ fn config_from_options(
     cleanup: f64,
     cleanup_strength: f64,
     grid_scale: f64,
+    grid_fitter: f64,
 ) -> std::result::Result<Config, String> {
     let k_colors = checked_u32("k_colors", k_colors)?;
     let algorithm = checked_u32("algorithm", algorithm)?;
     let cleanup = checked_u32("cleanup", cleanup)?;
     let cleanup_strength = checked_u32("cleanup_strength", cleanup_strength)?;
+    let grid_fitter = checked_u32("grid_fitter", grid_fitter)?;
     if k_colors == 0 {
         return Err("k_colors must be greater than 0".to_string());
     }
@@ -389,6 +408,7 @@ fn config_from_options(
         cleanup,
         cleanup_strength: cleanup::Strength::try_from_u32(cleanup_strength)?,
         grid_scale: validate_grid_scale(grid_scale)?,
+        grid_fitter: grid::GridFitter::try_from_u32(grid_fitter)?,
         ..Default::default()
     })
 }
@@ -414,6 +434,9 @@ pub struct ProcessOptions {
     pub cleanup_strength: f64,
     /// Work on a grid this many times finer than the detected one, 1 to 16. Default 1.
     pub grid_scale: f64,
+    /// How the pixel grid is found: 0 = the original walker, 1 = the elastic fit on the
+    /// source image (experimental; changes the snap output). Default 0.
+    pub grid_fitter: f64,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -428,6 +451,7 @@ impl ProcessOptions {
             cleanup: 0.0,
             cleanup_strength: 1.0,
             grid_scale: 1.0,
+            grid_fitter: 0.0,
         }
     }
 }
@@ -447,6 +471,7 @@ pub fn process_image_with(
         opts.cleanup,
         opts.cleanup_strength,
         opts.grid_scale,
+        opts.grid_fitter,
     )
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
 
@@ -530,7 +555,8 @@ fn parse_args() -> Option<Config> {
     }
 
     // Optional flags: --no-resize, --algorithm=<0-5>, --cleanup=off|blocks|smooth,
-    //                 --strength=light|medium|strong, --grid-scale=<1..16>, --stats
+    //                 --strength=light|medium|strong, --grid-scale=<1..16>,
+    //                 --grid-fitter=walk|dp, --stats
     // Algorithm IDs: 0=K-Means Perceptual, 1=Median Cut, 2=Wu's Optimal,
     //                3=Spatial, 4=Grey Wolf, 5=Differentiable Palette
     for arg in args.iter().skip(3) {
@@ -546,6 +572,11 @@ fn parse_args() -> Option<Config> {
         } else if let Some(name) = arg.strip_prefix("--strength=") {
             match cleanup::Strength::from_name(name) {
                 Ok(strength) => config.cleanup_strength = strength,
+                Err(e) => eprintln!("Warning: {}", e),
+            }
+        } else if let Some(name) = arg.strip_prefix("--grid-fitter=") {
+            match grid::GridFitter::from_name(name) {
+                Ok(fitter) => config.grid_fitter = fitter,
                 Err(e) => eprintln!("Warning: {}", e),
             }
         } else if let Some(scale_str) = arg.strip_prefix("--grid-scale=") {
@@ -579,7 +610,7 @@ fn process_image(config: &Config) -> Result<()> {
         PixelSnapperError::ProcessingError(format!("Failed to read input file: {}", e))
     })?;
 
-    let (output_bytes, grid_size) = process_image_bytes_detailed(&img_bytes, config)?;
+    let (output_bytes, grid_report) = process_image_bytes_detailed(&img_bytes, config)?;
 
     std::fs::write(&config.output_path, &output_bytes).map_err(|e| {
         PixelSnapperError::ProcessingError(format!("Failed to write output file: {}", e))
@@ -589,7 +620,7 @@ fn process_image(config: &Config) -> Result<()> {
 
     if config.print_stats {
         let output_img = image::load_from_memory(&output_bytes)?.to_rgba8();
-        println!("{}", stats_json(config, &regions::image_stats(&output_img), grid_size));
+        println!("{}", stats_json(config, &regions::image_stats(&output_img), grid_report));
     }
     Ok(())
 }
@@ -601,7 +632,7 @@ fn process_image(config: &Config) -> Result<()> {
 fn stats_json(
     config: &Config,
     stats: &regions::ImageStats,
-    grid_size: Option<(usize, usize)>,
+    grid_report: Option<GridReport>,
 ) -> String {
     let raw_name = std::path::Path::new(&config.input_path)
         .file_name()
@@ -616,12 +647,16 @@ fn stats_json(
             c => input_name.push(c),
         }
     }
-    let grid = match grid_size {
-        Some((cols, rows)) => format!("[{},{}]", cols, rows),
+    let grid = match grid_report {
+        Some(r) => format!("[{},{}]", r.cols, r.rows),
+        None => "null".to_string(),
+    };
+    let residual = match grid_report.and_then(|r| r.residual) {
+        Some(r) => format!("{:.5}", r),
         None => "null".to_string(),
     };
     format!(
-        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"cleanup\":\"{}\",\"strength\":\"{}\",\"grid_scale\":{},\"grid\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
+        "{{\"input\":\"{}\",\"mode\":\"{}\",\"k\":{},\"algorithm\":{},\"cleanup\":\"{}\",\"strength\":\"{}\",\"grid_scale\":{},\"fitter\":\"{}\",\"grid\":{},\"residual\":{},\"width\":{},\"height\":{},\"unique_colors\":{},\"regions\":{},\"regions_lt4\":{},\"regions_lt16\":{}}}",
         input_name,
         if config.no_resize { "no-resize" } else { "snap" },
         config.k_colors,
@@ -629,7 +664,9 @@ fn stats_json(
         config.cleanup.name(),
         config.cleanup_strength.name(),
         config.grid_scale,
+        config.grid_fitter.name(),
         grid,
+        residual,
         stats.width,
         stats.height,
         stats.unique_colors,
@@ -3577,31 +3614,38 @@ mod tests {
 
     #[test]
     fn options_are_validated_not_clamped() {
-        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0, 2.0).unwrap();
+        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0, 2.0, 0.0).unwrap();
         assert_eq!(ok.k_colors, 8);
         assert!(ok.no_resize);
         assert_eq!(ok.algorithm, QuantAlgorithm::SpatialQuantization);
         assert_eq!(ok.cleanup, Cleanup::Blocks);
         assert_eq!(ok.cleanup_strength, cleanup::Strength::Medium);
         assert_eq!(ok.grid_scale, 2.0);
-        assert_eq!(config_from_options(8.0, true, 0.0, 2.0, 3.0, 1.0).unwrap().cleanup, Cleanup::Smooth);
+        assert_eq!(config_from_options(8.0, true, 0.0, 2.0, 3.0, 1.0, 0.0).unwrap().cleanup, Cleanup::Smooth);
 
-        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0, 1.0).is_err(), "zero colours");
-        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0, 1.0).is_err(), "unknown algorithm");
-        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0, 1.0).is_err(), "unknown cleanup");
-        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0, 1.0).is_err(), "cleanup without no_resize");
-        assert!(config_from_options(16.0, false, 0.0, 2.0, 1.0, 1.0).is_err(), "smooth without no_resize");
+        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0, 1.0, 0.0).is_err(), "zero colours");
+        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0, 1.0, 0.0).is_err(), "unknown algorithm");
+        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0, 1.0, 0.0).is_err(), "unknown cleanup");
+        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0, 1.0, 0.0).is_err(), "cleanup without no_resize");
+        assert!(config_from_options(16.0, false, 0.0, 2.0, 1.0, 1.0, 0.0).is_err(), "smooth without no_resize");
+        assert_eq!(
+            config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 1.0).unwrap().grid_fitter,
+            grid::GridFitter::Dp
+        );
+        for fitter in [2.0, -1.0, 0.5, f64::NAN] {
+            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, fitter).is_err(), "fitter {fitter}");
+        }
         for strength in [0.0, 4.0, 1.5, f64::NAN] {
-            assert!(config_from_options(16.0, true, 0.0, 2.0, strength, 1.0).is_err(), "strength {strength}");
+            assert!(config_from_options(16.0, true, 0.0, 2.0, strength, 1.0, 0.0).is_err(), "strength {strength}");
         }
         for scale in [0.0, 0.99, 16.5, -2.0, f64::NAN, f64::INFINITY] {
-            assert!(config_from_options(16.0, true, 0.0, 0.0, 1.0, scale).is_err(), "grid scale {scale}");
+            assert!(config_from_options(16.0, true, 0.0, 0.0, 1.0, scale, 0.0).is_err(), "grid scale {scale}");
         }
         // What `>>> 0` would have turned into something valid.
         for bad in [f64::NAN, f64::INFINITY, -1.0, 1.5, 4294967296.0, 4294967312.0] {
-            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0, 1.0).is_err(), "k_colors {bad}");
-            assert!(config_from_options(16.0, true, bad, 0.0, 1.0, 1.0).is_err(), "algorithm {bad}");
-            assert!(config_from_options(16.0, true, 0.0, bad, 1.0, 1.0).is_err(), "cleanup {bad}");
+            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0, 1.0, 0.0).is_err(), "k_colors {bad}");
+            assert!(config_from_options(16.0, true, bad, 0.0, 1.0, 1.0, 0.0).is_err(), "algorithm {bad}");
+            assert!(config_from_options(16.0, true, 0.0, bad, 1.0, 1.0, 0.0).is_err(), "cleanup {bad}");
         }
         assert_eq!(checked_u32("x", 4294967295.0), Ok(u32::MAX));
         assert_eq!(checked_u32("x", 0.0), Ok(0));
@@ -3610,7 +3654,7 @@ mod tests {
     /// `process_image_with` with default options must be the legacy snap output.
     #[test]
     fn default_options_reproduce_the_legacy_output() {
-        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0).unwrap();
+        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0).unwrap();
         for (name, bytes, golden) in golden_fixtures() {
             let png = process_image_bytes_common(bytes, Some(config.clone())).unwrap();
             assert_eq!(fnv1a(&png), golden.png, "fixture {name}");
@@ -3660,10 +3704,12 @@ mod tests {
         };
         assert_eq!(
             stats_json(&config, &stats, None),
-            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"cleanup":"off","strength":"light","grid_scale":1,"grid":null,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
+            r#"{"input":"wolf \"x\".png","mode":"no-resize","k":16,"algorithm":3,"cleanup":"off","strength":"light","grid_scale":1,"fitter":"walk","grid":null,"residual":null,"width":4,"height":3,"unique_colors":2,"regions":5,"regions_lt4":1,"regions_lt16":5}"#
         );
         let blocks = Config { cleanup: Cleanup::Blocks, grid_scale: 1.5, ..config };
-        assert!(stats_json(&blocks, &stats, Some((12, 9)))
-            .contains(r#""cleanup":"blocks","strength":"light","grid_scale":1.5,"grid":[12,9],"#));
+        let report = GridReport { cols: 12, rows: 9, residual: Some(0.0123456) };
+        assert!(stats_json(&blocks, &stats, Some(report)).contains(
+            r#""cleanup":"blocks","strength":"light","grid_scale":1.5,"fitter":"walk","grid":[12,9],"residual":0.01235,"#
+        ));
     }
 }

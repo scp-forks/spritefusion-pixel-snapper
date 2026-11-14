@@ -532,3 +532,80 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
   with a CLI binary that predated the sieve fix (`cargo test` does not rebuild it), and
   disagreed with the corpus baseline. All figures here are from a fresh build.
 - Codex review (`docs/reviews/phase-3-review.md`): four findings, three fixed, one deferred.
+
+### Phase 4 — done
+
+- `grid.rs`: `GridFitter { Walk, Dp }`, `edge_profiles`, `dp_cuts`, a shared
+  `profiles` / `detect` / `refine` API used by snap mode, Blocks and Smooth, and
+  `residual`. CLI `--grid-fitter=walk|dp`; `ProcessOptions.grid_fitter`; a "Grid fit"
+  select in the app (Standard / Elastic (beta)), hidden only for plain palette reduction.
+  `--stats` gained `fitter` and `residual`. The default is `Walk`; all 78 legacy lines
+  of the corpus baseline are unchanged and the golden tests pass.
+- Results at 16 colours, snap mode (grid, residual of the source on that grid):
+
+  | image | Walk | DP |
+  |---|---|---|
+  | wolf | 205×208, 0.0134 | 206×203, 0.0128 |
+  | coliseum | 188×100, 0.0214 | 183×99, 0.0195 |
+  | ogtrail | 181×103, 0.0360 | 196×112, 0.0323 |
+  | city | 111×120, 0.0695 | 100×95, 0.0731 |
+  | sprite sheet (true grid 256×256) | 169×169, 0.0682 | **256×256**, 0.0268 |
+  | cat | 228×219, 0.0281 | 256×256, 0.0265 |
+  | wolf's snap output upscaled ×5 and ×4, nearest neighbour (true grid 205×208) | 68×70, 0.036 | **205×208, 0.0000** |
+
+  Same speed as Walk (0.4–0.5 s per megapixel image, natively).
+- "Done when", item by item:
+  - *Sprite sheet's grid unchanged*: met, and better than that. DP gets the true 256×256
+    where Walk gets 169×169.
+  - *Wolf within 8 % of Walk's 205×208*: met (206×203).
+  - *Coliseum residual at least 25 % under Walk's*: **not met: 9 %** (0.0195 against
+    0.0214). The 25 % was never a fair target. It came from the research's "29–35 %
+    better", which compared the elastic fit with *uniform* grids and was then misquoted,
+    by me, as an advantage over the walker. Corrected in `02-experiments.md` and `03`.
+- Where the DP fitter earns its place instead:
+  - **Crisp pixel art.** Its profile is the difference between adjacent columns, which
+    peaks on the cut itself, so the step estimate works where the legacy one sees a
+    two-sample plateau and gives up. This is the fix for the bug found in Phase 1.
+  - **Cut placement.** On the synthetic blurred lattice, Blocks puts 100.0 % of pixels
+    right with DP against 90.7 % with Walk (test `dp_grid_puts_cuts_on_the_edges`).
+  - **Cell count.** 40×40 on every synthetic soft lattice tried, where Walk is off by one
+    on half of them.
+- Three things the research prototype did not have, each added because a measurement
+  failed without it:
+  1. *Edge gains against the local median.* The prototype's "cost 1 per cut" (gain
+     measured against the global mean) makes cuts in flat areas cost, and stretches flat
+     areas by an eighth: the crisp wolf came back 197×204. Measured against a local mean
+     it over-corrects (216×214), because the mean is raised by the very edges being
+     measured. Against the local median the count is exact (205×208).
+  2. *Pitch search.* The step estimate is a median of whole-pixel spacings, so at 5 px it
+     is off by up to 10 %, and missing peaks pull it higher (6.0 on the wolf). The fit is
+     run at 37 pitches from 0.8× to 1.25× the estimate and the best total score kept.
+     On synthetic lattices the pitch it settles on is within 5 % of the true mean cell.
+     (An earlier attempt, re-estimating the pitch from the fitted cuts and iterating,
+     drifted steadily towards smaller cells on every image without a crisp lattice.)
+  3. *×1.5 is not a size, it is a search.* A clean lattice has nothing at two thirds of
+     its pitch. The re-fit goes wherever the edges and the step bounds let it: on 8 px
+     cells that is the ×2 grid, on 3 px cells it is the original cuts, which is not finer,
+     so `refine` returns `None` and the rung is dropped. On images with sub-cell detail it
+     finds intermediate structure. Integer scales subdivide and always work.
+  4. *Borders inside the optimisation.* The prototype let the first and last cut float
+     and then deleted border slivers, which left a grid the optimiser had not chosen and
+     a score that did not belong to it. Cuts now run from 0 to the limit by construction,
+     and a brute-force test checks the result is optimal.
+- Known limits, not addressed:
+  - The step estimate (shared with Walk) ignores peaks closer than 4 px, so lattices
+    under about 4 px are estimated too coarse; the search's lower bound of 0.8× recovers
+    only part of that (a 3.5 px synthetic lattice comes out at 4.0).
+  - On the wolf the right answer is not knowable: its stair-steps measure anywhere from
+    4 to 6 px. Both fitters are defensible there.
+  - The city (no lattice) gets a slightly coarser grid from DP (100×95) than from Walk
+    (111×120). Neither means anything; the lattice score of Phase 5 is what should say so.
+  - Interior steps are now really within ±25 % of the pitch (they were ±40 % at small
+    pitches before the review). The research saw steps of 6 to 12 on the coliseum at a
+    pitch of 9.3; the fit now allows 7 to 11 there.
+- Codex review (`docs/reviews/phase-4-review.md`): six findings, all fixed. The table
+  above was remeasured from a fresh build afterwards.
+- Decision for the owner, unchanged from Phase 1 but now with evidence: the legacy
+  default cannot measure crisp pixel art (68×70 instead of 205×208). DP fixes that and
+  is opt-in. Making it the default would change every existing output.
+

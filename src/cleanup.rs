@@ -4,7 +4,7 @@
 //! "pixel art" that leaves speckle: blends between two logical pixels land on some
 //! third palette colour. The stages here put the missing spatial step back.
 
-use crate::grid::{detect_grid, refine_grid, Grid};
+use crate::grid::{self, Grid, Profiles};
 use crate::indexed::{index_image, render, IndexedImage, TRANSPARENT};
 use crate::{regions, srgb_to_oklab, Config, Result};
 use image::RgbaImage;
@@ -22,13 +22,13 @@ pub struct Cleaned {
 /// The detected grid refined by `scale`, or by the nearest smaller standard scale
 /// that is achievable, or `base` itself. Refined grids never have a cell under 2 px;
 /// `base` is returned as given, so pass `Grid::with_min_cells` if that matters.
-pub fn grid_at_scale(base: Grid, quantized: &RgbaImage, config: &Config, scale: f64) -> Grid {
+pub fn grid_at_scale(base: Grid, profiles: &Profiles, config: &Config, scale: f64) -> Grid {
     if scale <= 1.0 {
         return base;
     }
     std::iter::once(scale)
         .chain(FALLBACK_SCALES.into_iter().filter(|&s| s < scale))
-        .find_map(|s| refine_grid(&base, quantized, config, s))
+        .find_map(|s| grid::refine(&base, profiles, config, s))
         .unwrap_or(base)
 }
 
@@ -51,7 +51,8 @@ pub fn blocks(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Res
     // (it would keep the very speckle this is meant to remove), so they are merged
     // away before anything else. `grid_at_scale` keeps the guarantee: every refinement
     // enforces it, and its last resort is this base grid.
-    let base = detect_grid(quantized, config)?.with_min_cells();
+    let profiles = grid::profiles(source, quantized, config)?;
+    let base = grid::detect(&profiles, source.width(), source.height(), config)?.with_min_cells();
 
     // Un-mix before voting: blend pixels then vote for one of the two colours they lie
     // between instead of for an unrelated third. (Measured in research on the coliseum
@@ -61,7 +62,7 @@ pub fn blocks(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Res
     let pal_lab = palette_oklab(&ix.palette);
     unmix(&mut ix, &lab, &pal_lab, unmix_radius(estimated_pitch(Some(&base))));
 
-    let grid = grid_at_scale(base, quantized, config, config.grid_scale);
+    let grid = grid_at_scale(base, &profiles, config, config.grid_scale);
 
     let winners = vote_cells(&ix, &grid);
     paint_cells(&mut ix, &grid, &winners);
@@ -241,9 +242,9 @@ pub fn smooth(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> Res
         return Ok(Cleaned { image: render(&ix), grid: None });
     }
     // Grid detection is only a pitch estimate here, and is allowed to fail.
-    let grid = (source.width() >= 3 && source.height() >= 3)
-        .then(|| detect_grid(quantized, config).ok())
-        .flatten();
+    let grid = grid::profiles(source, quantized, config)
+        .and_then(|p| grid::detect(&p, source.width(), source.height(), config))
+        .ok();
     let pitch = estimated_pitch(grid.as_ref());
 
     let lab = source_oklab(source);
@@ -468,7 +469,13 @@ pub fn sieve(ix: &mut IndexedImage, lab: &[[f32; 3]], pal_lab: &[[f32; 3]], min_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::{detect_grid, refine_grid};
     use crate::test_util::{recovered_fraction, recovered_pixel_fraction, synthetic_lattice, DISTINCT_8};
+
+    /// Legacy-fitter profiles of an image that is its own quantization.
+    fn walk_profiles(img: &RgbaImage) -> Profiles {
+        grid::profiles(img, img, &Config::default()).unwrap()
+    }
     use crate::{regions, run_pipeline, Cleanup};
     use image::Rgba;
     use rand::prelude::*;
@@ -652,7 +659,7 @@ mod tests {
         let base = Grid { cols: cuts(&cols), rows: cuts(&rows), step: (8.0, 8.0), step_estimated: true };
         let config = Config::default();
         for scale in [1.0, 2.0, 3.0] {
-            let grid = grid_at_scale(base.clone(), &img, &config, scale);
+            let grid = grid_at_scale(base.clone(), &walk_profiles(&img), &config, scale);
             if scale > 1.0 {
                 assert!(grid.cell_count() > 3 * base.cell_count(), "scale {scale}");
             }
@@ -761,8 +768,8 @@ mod tests {
         // 5 px cells: x3 would need 1 px parts (only x2 fits), so x3 becomes x2.
         let cuts: Vec<usize> = (0..=6).map(|i| i * 5).collect();
         let base = Grid { cols: cuts.clone(), rows: cuts.clone(), step: (5.0, 5.0), step_estimated: true };
-        let at3 = grid_at_scale(base.clone(), &img, &config, 3.0);
-        let at2 = grid_at_scale(base.clone(), &img, &config, 2.0);
+        let at3 = grid_at_scale(base.clone(), &walk_profiles(&img), &config, 3.0);
+        let at2 = grid_at_scale(base.clone(), &walk_profiles(&img), &config, 2.0);
         assert_eq!(at3.cols, at2.cols);
         assert_eq!(at2.cols.len() - 1, 12);
         // 2 px cells cannot be refined at all (every `refine_grid` call returns None):
@@ -772,8 +779,8 @@ mod tests {
         for scale in [1.5, 2.0, 3.0] {
             assert_eq!(refine_grid(&base, &img, &config, scale), None, "scale {scale}");
         }
-        assert_eq!(grid_at_scale(base.clone(), &img, &config, 3.0), base);
-        assert_eq!(grid_at_scale(base.clone(), &img, &config, 1.0), base);
+        assert_eq!(grid_at_scale(base.clone(), &walk_profiles(&img), &config, 3.0), base);
+        assert_eq!(grid_at_scale(base.clone(), &walk_profiles(&img), &config, 1.0), base);
     }
 
     // ---------------------------------------------------------------- Smooth
@@ -1175,7 +1182,12 @@ mod tests {
         let (img, _) = synthetic_lattice(&[8; 24], &[8; 24], &DISTINCT_8, true, 4, 21);
         let quantized = run_pipeline(&img, &Config { cleanup: Cleanup::Off, ..blocks_config(LATTICE_K, 2.0) }).unwrap().image;
         let config = blocks_config(LATTICE_K, 2.0);
-        let grid = grid_at_scale(detect_grid(&quantized, &config).unwrap().with_min_cells(), &quantized, &config, 2.0);
+        let grid = grid_at_scale(
+            detect_grid(&quantized, &config).unwrap().with_min_cells(),
+            &grid::profiles(&img, &quantized, &config).unwrap(),
+            &config,
+            2.0,
+        );
 
         let raw = {
             let mut ix = index_image(&img, &quantized).unwrap();
