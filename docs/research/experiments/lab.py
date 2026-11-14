@@ -177,12 +177,12 @@ def pitch_acf(profile, lo=3, hi=40):
         est = j / mlt
     return est, float(ac[fund])
 
-def cuts_dp(profile, pitch, limit, tol=0.25, lam=1.0):
+def cuts_dp(profile, pitch, limit, tol=0.25, lam=1.0, cut_cost=0.0):
     """Elastic comb: choose cuts 0=c0<c1<...<cn=limit maximising sum(profile[c_i]) minus a
     quadratic penalty on (c_i - c_{i-1} - pitch), with every step within pitch*(1 +- tol).
     Globally optimal (Viterbi), unlike the greedy walker."""
     lo = max(1, int(np.floor(pitch * (1 - tol)))); hi = int(np.ceil(pitch * (1 + tol)))
-    pn = profile / (profile.mean() + 1e-9)
+    pn = profile / (profile.mean() + 1e-9) - cut_cost   # cut_cost=1: a cut on an average column earns nothing (E16)
     NEG = -1e18
     best = np.full(limit + 1, NEG); prev = np.full(limit + 1, -1, np.int64)
     # free start: the first cut may be anywhere in [0, hi] (partial first cell)
@@ -408,3 +408,28 @@ def core_constrained(olab, pal_lab, labels, flat_thr=0.03, radius=3, core_size=3
         best[upd] = d[upd]; out[upd] = j
     out[core] = labels[core]
     return out, core
+
+# ------------------------------------------------ colour-aware sieve (E16) ----
+def sieve_colour(labels, olab, pal_lab, min_area, max_pass=6):
+    """Dissolve components smaller than min_area into the ADJACENT label whose palette colour is
+    closest to the component's own mean source colour. Sequential, smallest first, so two small
+    neighbours cannot swap. Replaces merge_small_components, which hands every small fragment to
+    the nearest surviving pixel and so erases any region that is a fine mix of two similar palette
+    colours (the wolf's outline)."""
+    lab = labels.copy(); h, w = lab.shape
+    for _ in range(max_pass):
+        comp = measure.label(lab + 1, connectivity=1, background=0); area = np.bincount(comp.ravel())
+        small = np.flatnonzero(area < min_area); small = small[small > 0]
+        if len(small) == 0: break
+        objs = ndi.find_objects(comp); changed = 0
+        for c in small[np.argsort(area[small], kind='stable')]:
+            sl = objs[c - 1]; y0, y1 = max(sl[0].start - 1, 0), min(sl[0].stop + 1, h); x0, x1 = max(sl[1].start - 1, 0), min(sl[1].stop + 1, w)
+            m = comp[y0:y1, x0:x1] == c; sub = lab[y0:y1, x0:x1]
+            own = sub[m][0]
+            if not (sub[m] == own).all(): continue          # already repainted this pass
+            ring = ndi.binary_dilation(m) & ~m; nb = np.unique(sub[ring]); nb = nb[nb != own]
+            if len(nb) == 0: continue
+            mean = olab[y0:y1, x0:x1][m].mean(0)
+            sub[m] = nb[((pal_lab[nb] - mean) ** 2).sum(-1).argmin()]; changed += 1
+        if not changed: break
+    return lab

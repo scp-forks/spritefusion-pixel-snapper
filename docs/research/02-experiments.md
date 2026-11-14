@@ -12,6 +12,11 @@ Test images:
 | `pixel-art-sample-1024x1024.png` | 1024×1024 | AI sprite sheet, clean lattice at exactly 4 px, JPEG-ish noise |
 | `cat-1024x1024.png` | 1024×1024 | **Not** pixel art (crayon illustration). Negative control |
 
+A second batch (`wolf.png`, `ogtrail.png`, `isometric-city-with-tiny-cars.png`) was added
+later and is reported separately in `04-second-batch.md`. It corrects three things in
+this file: the dissolve step used in E3/E7/E14 (it can erase outlines), the pitch
+estimator, and the claim that ×2 is generally the right rung.
+
 Colour distances are Euclidean in OKLab (0.02 ≈ just visible, 0.10 = obviously a different colour).
 
 ## Metrics
@@ -418,7 +423,7 @@ know the feature was supposed to be a rectangle.
 
 ## Limits of this evidence
 
-- Three images, one of which is a negative control. Every threshold above (¼ cell,
+- Three images in this file, one of which is a negative control (six with `04-second-batch.md`). Every threshold above (¼ cell,
   0.03 flatness, τ, ±25 % step tolerance) is tuned on essentially one image.
 - No image with intentional dithering was available. Dissolve, mode filter and cell
   voting will all flatten a checkerboard dither; none of the "protect dither" ideas in

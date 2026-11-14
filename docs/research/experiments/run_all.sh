@@ -11,6 +11,10 @@ for a in 0 1 2 3 4 5; do "$B" "$REPO/other/colliseum.png" "$PSNAP_OUT/col_k16_a$
 for k in 4 8 32 64; do "$B" "$REPO/other/colliseum.png" "$PSNAP_OUT/col_k${k}_a0.png" $k --no-resize --algorithm=0 >/dev/null; done
 "$B" "$REPO/other/colliseum.png" "$PSNAP_OUT/col_snap_k16.png" 16 >/dev/null
 "$B" "$REPO/other/pixel-art-sample-1024x1024.png" "$PSNAP_OUT/sample_k16_a0.png" 16 --no-resize --algorithm=0 >/dev/null
-for s in e1_baseline e2_local_grid e3_despeckle e4_scale_sweep e5_snap_in_place e6_diagnose e7_unmix e8_tiling e9_lattice_score e10_elastic_sweep e11_detail_reducers e13_uniform_best_phase; do
+for n in isometric-city-with-tiny-cars:city ogtrail:ogtrail wolf:wolf; do   # second batch (04-second-batch.md)
+  "$B" "$REPO/other/${n%%:*}.png" "$PSNAP_OUT/${n##*:}_k16_a0.png" 16 --no-resize --algorithm=0 >/dev/null
+  "$B" "$REPO/other/${n%%:*}.png" "$PSNAP_OUT/${n##*:}_snap_k16.png" 16 >/dev/null
+done
+for s in e1_baseline e2_local_grid e3_despeckle e4_scale_sweep e5_snap_in_place e6_diagnose e7_unmix e8_tiling e9_lattice_score e10_elastic_sweep e11_detail_reducers e13_uniform_best_phase e15_pitch_spectrum e16_second_batch e17_local_pitch; do   # e15 takes several minutes
   echo "=================== $s"; "$PY" "$s.py"
 done
