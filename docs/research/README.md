@@ -10,6 +10,7 @@ Read in this order:
 | [`03-synthesis-and-recommendations.md`](03-synthesis-and-recommendations.md) | **Start here.** Answers, agreements and disagreements between the three lines of work, proposed build order, open questions |
 | [`02-experiments.md`](02-experiments.md) | Measurements on the images in `other/`: baseline speckle, cause analysis, cleanup variants, resolution sweeps, tiling |
 | [`04-second-batch.md`](04-second-batch.md) | Three more images (wolf, ogtrail, isometric city) run through the same pipeline; what held, what did not, and three prototype fixes |
+| [`05-evaluation.md`](05-evaluation.md) | Generated pixel art with known answers, damaged and recovered: grid recovery, dithering survival, and edge-weighted Potts against the sieve |
 | [`01-literature-survey.md`](01-literature-survey.md) | Papers and open-source tools, with verification tags per claim |
 | [`codex-independent-report.md`](codex-independent-report.md) | Independent report by Codex (gpt-6.1-sol, xhigh), unedited |
 | [`figures/`](figures/) | Comparison crops (`fig*.png`, panels left to right as named) and full-size results (`full/`) |

@@ -1,6 +1,10 @@
 # Plan: speckle cleanup and size audition
 
-Status: in progress on branch `feature/cleanup-and-audition`. See "Progress" at the end. Revised after a review by Codex (gpt-6.1-sol, xhigh):
+Status: **all eight phases implemented** on branch `feature/cleanup-and-audition`, one
+commit per phase, each reviewed by Codex before it was committed. "Progress" at the end
+records, per phase, what was built, what was measured, where the result differs from
+this plan, and what the review changed. The plan text above it is as it was written
+before implementation; where the two disagree, Progress is what is true. Revised after a review by Codex (gpt-6.1-sol, xhigh):
 `docs/reviews/no-resize-cleanup-and-audition-review.md`. All nine findings were accepted.
 
 Evidence for the choices here is in `docs/research/` (`03-synthesis-and-recommendations.md`,
@@ -757,4 +761,95 @@ Each phase is reviewed by Codex (gpt-6.1-sol, xhigh) before it is committed. Rev
 - Codex review (`docs/reviews/phase-6-review.md`): no defect found; five gaps in the
   tests, all closed. The overlay's painting is now a pure, tested function
   (`spritefusion-frontend/src/overlay.ts`), and the frontend has 18 tests.
+
+### Phase 7 — done (the parts a program can do)
+
+- `src/eval.rs`, test-only: generated true pixel art (with and without a dithered band),
+  six kinds of damage, nine modes, and four scores. A fixed subset runs in `cargo test`
+  as a regression guard; the full tables and the Potts comparison are `--ignored` tests.
+  Results and method are in `docs/research/05-evaluation.md`.
+- **It found a real weakness and that was fixed in this phase**, in the opt-in elastic
+  fitter only. On the first run the elastic fitter was within 2 % of the true size in 1
+  of 6 scenes at a 9.3 px pitch, and one *crisp* scene came back as 44×35 instead of
+  72×54. Both were the legacy step estimate it had inherited (Phase 4's plan said
+  "pitch estimation stays as it is"): on sparse art most neighbouring edges are two
+  cells apart and the median spacing doubles; on soft art noise peaks drag it down. The
+  elastic fitter now has its own estimate, `grid::comb_pitch`: lay combs of every
+  spacing on the edge profiles, measure the share of edge energy each collects above
+  chance, take the coarsest that is nearly as good as the best, and read the pitch from
+  the gaps between its teeth that sit on real edges. After it: 6 of 6 in both cases.
+  The legacy estimate remains the fallback when no comb stands out, and remains what
+  the standard fitter uses.
+- Headline results (generated art, six scenes per row, twelve rows):
+  - Standard fitter: within 2 % of the true size in 0 to 2 scenes in eight rows; 89 to
+    97 % of cells right.
+  - Elastic fitter: 6 of 6 in ten rows, 98.8 to 100 % of cells right; the two JPEG rows
+    are the exception (4 and 3 of 6).
+  - **Dithering survives**: Blocks with the elastic fitter keeps 91 to 100 % of
+    dithered cells; Smooth keeps 100 % at Light and Medium everywhere and at Strong
+    everywhere but a 4.2 px pitch (60 %). What destroys dithering is a wrong grid: snap
+    with the standard fitter keeps 43 to 76 %. This closes the largest open question of
+    the research for checkerboard dithering at 4 px and up.
+  - Blocks on the standard fitter's grid is slightly *worse* than plain palette
+    reduction in eight of twelve rows; on the elastic fitter's grid it is never below
+    plain and is the best or equal best full-size mode in eleven.
+- **Edge-weighted Potts** (the open experiment), compared with shipping Smooth's own
+  parameters and the same sieve in every arm: alone it does not remove speckle; in
+  place of un-mixing it is better on the wolf and worse on the coliseum; added after
+  un-mixing it leaves 2 to 22 % fewer regions under 16 px, for about a second per
+  megapixel against a tenth to a quarter. Neither a replacement nor clearly worth its
+  cost on this evidence. Not built in.
+- On the six real images the new estimate moved the elastic fitter's grids little:
+  wolf 201×202 (was 206×203), coliseum 183×99, sprite sheet 256×256, crisp wolf 205×208
+  exactly, ogtrail and the city unchanged (no comb stands out; legacy fallback). The cat
+  goes to 128×128: it has a JPEG lattice at 8 px and the comb finds it. Its lattice
+  score is 0.02, which is what should tell the user.
+- Not done, because only a person can: `other/picks.tsv` is in place for recording
+  which size was actually chosen for each real image, and is empty.
+- Known limits of the new estimate: its constants were set on this harness and six
+  images; a profile of a few dozen strong edges at unrelated positions and nothing else
+  reads as a fine lattice (pinned by `sparse_unrelated_edges_read_as_a_fine_lattice`);
+  JPEG at a pitch near 8 px still confuses the fit in a third to a half of the scenes.
+- Along the way three other estimators were tried and dropped: re-estimating from the
+  fitted cuts (drifts fine), an empirical chance level from shuffled gains (shuffling
+  breaks up soft edges and makes chance look better than the real thing), and squared
+  gains (a few edges then dominate and every fine comb collects them).
+- Codex review (`docs/reviews/phase-7-review.md`): five findings, all fixed, and two of
+  them changed conclusions I had already written down:
+  - The pixels-right score mapped pixels by their corners instead of their centres, so
+    at fractional scales it penalised correctly placed borders. Corrected, the elastic
+    Blocks result went from "best in nine rows" to "best in eleven, never below plain".
+  - The Potts comparison had run un-mix + sieve without the pitch scaling shipping
+    Smooth uses. Corrected, "Potts is the better pre-pass" became "not consistently
+    better". The edge metric also allowed two pixels where it claimed one, and the
+    optimiser could stop short of a local minimum; both fixed and tested.
+  - The new pitch estimate halved the pitch on wide, low images, because an axis too
+    short to hold a comb still counted against it. Fixed, with a test.
+
+### After the last phase: what is left for the owner
+
+Decisions (from "Decisions for the owner" above, with what is now known):
+
+1. **Default cleanup with No Resize**: still Off. Blocks and Smooth are both ready to be
+   the default; which one is a taste question the evaluation cannot answer.
+2. **The sizes strip sits beside the automatic result**: done that way. With the
+   standard fitter today's result is selected by default, byte for byte.
+3. **Web Worker**: at 1 MP the longest freeze is 1.3 s (Blocks), under the plan's 1.5 s
+   line; at 1.6 MP it is 1.9 s. Typing a width costs a full run. A Worker would remove
+   the freeze; a session object would make typed widths nearly free.
+4. **Old WASM exports**: kept, unchanged.
+5. **New: make the elastic fitter the default?** It is the largest quality lever found:
+   it measures crisp pixel art (the standard one returns 68×70 for a 205×208 image), it
+   finds the true grid in 6 of 6 generated scenes where the standard one manages 0 to
+   2, and Blocks is only better than doing nothing on its grid. It also changes every
+   existing snap output, which is why it is opt-in. Its pitch estimate is new and was
+   tuned on one harness and six images.
+
+Not built, by decision of the plan or of the evidence: per-tile processing; mixed cell
+sizes; a Potts pre-pass (tested: small gain, several times the cost); a Web Worker and a
+session object (measured, left to decision 3); a fix for palette starvation (ogtrail's
+vest turning green at 16 colours).
+
+Not done because only a person can: `other/picks.tsv`, the record of which size was
+actually chosen for each real image.
 

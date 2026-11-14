@@ -19,6 +19,8 @@ mod grid;
 mod indexed;
 mod regions;
 #[cfg(test)]
+mod eval;
+#[cfg(test)]
 mod test_util;
 
 #[repr(u32)]

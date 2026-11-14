@@ -241,11 +241,11 @@ pixels. The numpy prototypes run each stage in 0.1–1 s unoptimised.
 | Question | Experiment |
 |---|---|
 | Do the thresholds (sieve fraction, flatness 0.03, DP ±25 %, split τ) hold beyond one image? | Step 7 harness on a set of real AI images and synthetic damage |
-| Can intentional dithering be protected? | Images with ordered and irregular dither; measure false deletion and false protection separately |
+| ~~Can intentional dithering be protected?~~ Answered for checkerboard dithering (`05-evaluation.md`): with the right grid it survives Blocks (91–100 %) and Smooth at Light and Medium (100 %); a wrong grid is what destroys it | Remaining: irregular and ordered-matrix dither, and real images |
 | ~~Is the detail-weighted vote promoting noise elsewhere in the frame?~~ Answered: yes, on textured facades in the city (`fig18`) | Remaining: can it be limited to isolated features? |
 | How often is the native grid one octave too coarse? | Run the ladder on a corpus and record which rung a human picks |
 | Does the lattice score separate real cases? | Six images now: 0.52, 0.38, 0.24, 0.10, 0.09, 0.02. ogtrail (mixed blocks) and the city (no grid) are 0.01 apart |
-| Would an edge-weighted Potts cleanup beat the sieve? | Only a constant-weight ICM was tested (`lab.potts_icm`). Compare matched cleanup strength against outline preservation, with Rust timings |
+| ~~Would an edge-weighted Potts cleanup beat the sieve?~~ Tested (`05-evaluation.md`): not consistently better in place of un-mixing; a small gain added after it, at several times the cost | More images, and an optimised implementation, before deciding |
 | How should pitch be estimated on mixed-block images? | Per-region estimates are too noisy at 4×4 tiles (E17); try larger overlapping windows and a robust "finest well-supported" rule |
 | Does a 16-colour palette starve small saturated regions (ogtrail's vest and hair)? | Compare pixel-weighted and region-weighted palette fitting at fixed k |
 | Is drift non-separable often enough to justify a mesh? | Compare global, banded and tile-estimated fits on more images |

@@ -73,10 +73,18 @@ pub fn profiles(source: &RgbaImage, quantized: &RgbaImage, config: &Config) -> R
 
 /// Fit a grid of `width` x `height` to `profiles`.
 ///
-/// Both fitters estimate the step the same way (median spacing of profile peaks) and
-/// share the fallback. `Walk` then runs the legacy sequence unchanged: greedy walk and
-/// cross-axis stabilisation. `Dp` runs the elastic fit on each axis.
+/// `Walk` runs the legacy sequence unchanged: step from the median spacing of profile
+/// peaks, greedy walk, cross-axis stabilisation. `Dp` finds its own pitch (see
+/// [`comb_pitch`]), falling back to the legacy estimate when the profiles hold no
+/// lattice, and then runs the elastic fit on each axis.
 pub fn detect(profiles: &Profiles, width: u32, height: u32, config: &Config) -> Result<Grid> {
+    if profiles.fitter == GridFitter::Dp {
+        if let Some(pitch) = comb_pitch(profiles) {
+            let (pitch, cols, rows) = dp_fit_both_axes(profiles, pitch, pitch, width, height);
+            return Ok(Grid { cols, rows, step: (pitch, pitch), step_estimated: true });
+        }
+    }
+
     let step_x_opt = estimate_step_size(&profiles.x, config);
     let step_y_opt = estimate_step_size(&profiles.y, config);
     let step_estimated = step_x_opt.is_some() || step_y_opt.is_some();
@@ -178,6 +186,191 @@ pub fn refine_grid(
     let walk_config = Config { grid_fitter: GridFitter::Walk, ..config.clone() };
     let p = profiles(quantized, quantized, &walk_config).ok()?;
     refine(grid, &p, &walk_config, scale)
+}
+
+/// Baseline window for [`comb_pitch`]'s gains, in pixels either side. The pitch is not
+/// known yet; this only has to be wide enough to see past one edge.
+const COMB_BASELINE: f64 = 8.0;
+/// A comb's lift must reach this for the profiles to count as holding a lattice.
+const COMB_MIN_LIFT: f64 = 0.15;
+/// Among combs, the coarsest within this fraction of the best lift is the pitch.
+const COMB_NEAR_BEST: f64 = 0.85;
+/// A comb needs this many teeth on real edges, over both axes, to count as evidence.
+const COMB_MIN_EDGES: usize = 8;
+/// Combs that collect more than this share of shuffled gains are not considered.
+const COMB_MAX_CHANCE: f64 = 0.7;
+/// A tooth is on a real edge when its gain is at least this share of the largest.
+const COMB_EDGE_SHARE: f64 = 0.2;
+
+/// How much a comb's teeth may vary in spacing.
+#[derive(Clone, Copy, PartialEq)]
+enum CombFlex {
+    /// Within a quarter of the pitch either way: the freedom the final fit has. Follows
+    /// uneven cells. Its many positions make its chance level about a half, so it only
+    /// sees lattices whose edges are crisp.
+    Loose,
+    /// `n` or `n + 1` pixels: enough for any pitch between the two and for drift, and
+    /// few enough positions that soft, noisy edges still stand out from chance.
+    Tight,
+}
+
+/// The pitch of the lattice in `profiles`, or `None` if they hold none.
+///
+/// For a range of pitches, lay the best possible comb with teeth about that far apart
+/// and see what share of all the edge energy its teeth land on, on both axes together.
+/// A comb that matches the lattice collects nearly all of it. So does a comb at half
+/// or a third of the pitch, and so, by chance, does some of any comb: the share is
+/// therefore measured as *lift* above what teeth that close together would hit if the
+/// edges were placed at random, `(share - chance) / (1 - chance)`. A comb at twice the pitch
+/// misses every other edge and falls well short. The coarsest comb whose lift is
+/// within [`COMB_NEAR_BEST`] of the best is taken, and the pitch is read off its
+/// teeth: every gap between neighbouring teeth that sit on real edges is a whole
+/// number of cells. The result is not limited to whole pixels.
+///
+/// Two kinds of comb are tried, see [`CombFlex`]: loose ones first, because where
+/// they see a lattice at all they also see uneven ones; then tight ones, which see
+/// soft lattices the loose ones cannot.
+///
+/// This replaces the legacy estimate (median spacing of profile peaks) for the elastic
+/// fitter. That estimate is the weakest part of the legacy path: it is a whole number
+/// of pixels, it doubles when the art is sparse enough that most neighbouring edges
+/// are two cells apart, and noise peaks drag it down on soft images. On generated
+/// pixel art it put the elastic fitter within 2 % of the true size in 1 case of 6 at
+/// a 9.3 px pitch; see `docs/research/05-evaluation.md`.
+fn comb_pitch(profiles: &Profiles) -> Option<f64> {
+    let positive = |profile: &[f64]| -> Vec<f64> {
+        edge_gains(profile, COMB_BASELINE).into_iter().map(|g| g.max(0.0)).collect()
+    };
+    let (gx, gy) = (positive(&profiles.x), positive(&profiles.y));
+    comb_pitch_with(&gx, &gy, CombFlex::Loose).or_else(|| comb_pitch_with(&gx, &gy, CombFlex::Tight))
+}
+
+fn comb_pitch_with(gx: &[f64], gy: &[f64], flex: CombFlex) -> Option<f64> {
+    let total: f64 = gx.iter().sum::<f64>() + gy.iter().sum::<f64>();
+    if !(total > 0.0) {
+        return None;
+    }
+    // A lattice needs a few cells to show itself.
+    let coarsest = (gx.len().max(gy.len()) / 6).min(96);
+
+    // Distinct step ranges, fine to coarse.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    match flex {
+        CombFlex::Tight => ranges.extend((MIN_CELL_PX..=coarsest).map(|n| (n, n + 1))),
+        CombFlex::Loose => {
+            let mut nominal = MIN_CELL_PX as f64 / (1.0 - DP_STEP_TOLERANCE);
+            while nominal <= coarsest as f64 {
+                let r = StepRange::new(nominal);
+                if ranges.last() != Some(&(r.lo, r.hi)) {
+                    ranges.push((r.lo, r.hi));
+                }
+                nominal *= 1.04;
+            }
+        }
+    }
+
+    // (lift, the comb's teeth on each axis) per range.
+    let mut combs: Vec<(f64, Comb, Comb)> = Vec::new();
+    let (total_x, total_y): (f64, f64) = (gx.iter().sum(), gy.iter().sum());
+    for (lo, hi) in ranges {
+        let (x, y) = (comb_capture(gx, lo, hi), comb_capture(gy, lo, hi));
+        // An axis too short to hold this comb says nothing about it either way: its
+        // energy must not count against the comb. (Otherwise, on a wide, low image,
+        // every comb too coarse for the short axis loses to a finer harmonic.)
+        let total = if x.teeth.is_empty() { 0.0 } else { total_x }
+            + if y.teeth.is_empty() { 0.0 } else { total_y };
+        if !(total > 0.0) {
+            continue;
+        }
+        // What a comb this fine would collect from edges placed at random: each tooth
+        // has its pick of `hi - lo + 1` positions out of every `(lo + hi) / 2`. Combs
+        // fine enough to collect most of anything cannot show a lattice.
+        let chance = (hi - lo + 1) as f64 * 2.0 / (lo + hi) as f64;
+        if chance > COMB_MAX_CHANCE {
+            continue;
+        }
+        let lift = ((x.gain + y.gain) / total - chance) / (1.0 - chance);
+        combs.push((lift, x, y));
+    }
+    let best = combs.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max);
+    if !(best >= COMB_MIN_LIFT) {
+        return None;
+    }
+    // Coarsest comb near the best lift.
+    let (_, x, y) = combs.iter().rev().find(|c| c.0 >= COMB_NEAR_BEST * best)?;
+
+    // Its pitch, from the teeth that sit on real edges only: between edges a tooth
+    // floats wherever the noise is highest, and on sparse art most teeth float.
+    let strong = COMB_EDGE_SHARE * gx.iter().chain(gy).copied().fold(0.0, f64::max);
+    let on_edges = |c: &Comb, g: &[f64]| -> Vec<usize> {
+        c.teeth.iter().copied().filter(|&t| g[t] >= strong).collect()
+    };
+    let (ex, ey) = (on_edges(x, gx), on_edges(y, gy));
+    // One or two edges prove nothing: any comb can be laid through them.
+    if ex.len() + ey.len() < COMB_MIN_EDGES {
+        return None;
+    }
+    let covered = if x.teeth.is_empty() { 0 } else { gx.len() } + if y.teeth.is_empty() { 0 } else { gy.len() };
+    let mut pitch = covered as f64 / (x.teeth.len() + y.teeth.len()) as f64;
+    for _ in 0..3 {
+        // Each gap between neighbouring edges is a whole number of cells.
+        let (mut span, mut cells) = (0.0, 0.0);
+        for edges in [&ex, &ey] {
+            for gap in edges.windows(2).map(|p| (p[1] - p[0]) as f64) {
+                span += gap;
+                cells += (gap / pitch).round().max(1.0);
+            }
+        }
+        if cells > 0.0 {
+            pitch = span / cells;
+        }
+    }
+    Some(pitch)
+}
+
+/// What the best comb with tooth spacings in `lo..=hi` collects from `gains`.
+struct Comb {
+    /// Total gain under its teeth.
+    gain: f64,
+    /// Positions of its teeth, ascending.
+    teeth: Vec<usize>,
+}
+
+/// The comb with tooth spacings in `lo..=hi` that collects the most from `gains`. The
+/// first tooth may be anywhere in the first `hi` positions; the comb then runs to the
+/// last cell.
+fn comb_capture(gains: &[f64], lo: usize, hi: usize) -> Comb {
+    let len = gains.len();
+    if lo < 1 || len < 2 * hi {
+        return Comb { gain: 0.0, teeth: Vec::new() };
+    }
+    // best[i]: most gain of a comb whose last tooth is at i.
+    let mut best = vec![f64::NEG_INFINITY; len];
+    let mut prev = vec![usize::MAX; len];
+    for i in 0..len {
+        if i < hi {
+            best[i] = gains[i];
+        }
+        for step in lo..=hi.min(i) {
+            let v = best[i - step] + gains[i];
+            if v > best[i] {
+                best[i] = v;
+                prev[i] = i - step;
+            }
+        }
+    }
+    let mut end = len - hi;
+    for i in end..len {
+        if best[i] > best[end] {
+            end = i;
+        }
+    }
+    let mut teeth = vec![end];
+    while prev[*teeth.last().unwrap()] != usize::MAX {
+        teeth.push(prev[*teeth.last().unwrap()]);
+    }
+    teeth.reverse();
+    Comb { gain: best[end].max(0.0), teeth }
 }
 
 /// The elastic fit on both axes, at the pitch near the estimate that fits best.
@@ -1271,5 +1464,149 @@ mod tests {
         let (walk, dp) = (blocks(GridFitter::Walk), blocks(GridFitter::Dp));
         assert!(dp >= 0.97, "DP: {:.1}% of pixels right", dp * 100.0);
         assert!(dp > walk + 0.05, "DP {dp:.3} against walk {walk:.3}");
+    }
+
+    // ------------------------------------------------- comb pitch estimate
+
+    fn gains_from(profile: &[f64]) -> Vec<f64> {
+        edge_gains(profile, COMB_BASELINE).into_iter().map(|g| g.max(0.0)).collect()
+    }
+
+    /// Edges at every multiple of `pitch` (rounded), each kept with probability
+    /// `keep`, with a little noise everywhere.
+    fn lattice_profile(len: usize, pitch: f64, keep: f64, soft: bool, seed: u64) -> Vec<f64> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut p: Vec<f64> = (0..len).map(|_| rng.gen_range(0.0..0.3)).collect();
+        let mut at = pitch;
+        while (at.round() as usize) < len - 1 {
+            if rng.gen_bool(keep) {
+                let c = at.round() as usize;
+                let strength = rng.gen_range(5.0..15.0);
+                p[c] += strength;
+                if soft {
+                    p[c - 1] += strength * 0.6;
+                    p[c + 1] += strength * 0.6;
+                }
+            }
+            at += pitch;
+        }
+        p
+    }
+
+    fn comb_estimate(x: Vec<f64>, y: Vec<f64>) -> Option<f64> {
+        comb_pitch(&Profiles { x, y, fitter: GridFitter::Dp })
+    }
+
+    #[test]
+    fn comb_finds_whole_and_fractional_pitches() {
+        for &pitch in &[3.0, 4.2, 5.0, 5.3, 7.5, 9.3, 12.0, 16.4] {
+            for soft in [false, true] {
+                let got = comb_estimate(
+                    lattice_profile(600, pitch, 0.9, soft, 1),
+                    lattice_profile(450, pitch, 0.9, soft, 2),
+                )
+                .unwrap_or_else(|| panic!("pitch {pitch} soft {soft}: no lattice found"));
+                assert!((got / pitch - 1.0).abs() < 0.03, "pitch {pitch} soft {soft}: estimated {got:.3}");
+            }
+        }
+    }
+
+    /// Sparse art: most neighbouring edges are two or three cells apart, so the
+    /// median spacing of peaks (the legacy estimate) is a multiple of the pitch. The
+    /// comb still finds the pitch, because a comb at the multiple misses the edges in
+    /// between.
+    #[test]
+    fn comb_is_not_fooled_by_sparse_edges() {
+        let config = Config::default();
+        for &pitch in &[5.0, 8.0] {
+            let (x, y) = (lattice_profile(700, pitch, 0.4, false, 3), lattice_profile(500, pitch, 0.4, false, 4));
+            let legacy = estimate_step_size(&x, &config).unwrap();
+            assert!(legacy >= 1.5 * pitch, "the test needs a profile that fools the legacy estimate, got {legacy}");
+            let got = comb_estimate(x, y).unwrap();
+            assert!((got / pitch - 1.0).abs() < 0.03, "pitch {pitch}: estimated {got:.3}");
+        }
+    }
+
+    /// A wide, low image: the short axis cannot hold a comb at the true pitch. That
+    /// must not make the comb lose to a finer harmonic that does fit (Codex, Phase 7
+    /// review: edges every 12 px on a 120 x 18 image were read as a pitch of 6).
+    #[test]
+    fn comb_pitch_survives_a_short_axis() {
+        let edges_every = |len: usize, pitch: usize| -> Vec<f64> {
+            (0..len).map(|c| if c > 0 && c % pitch == 0 { 9.0 } else { 0.0 }).collect()
+        };
+        for pitch in [12usize, 16] {
+            let (long, short) = (edges_every(10 * pitch, pitch), edges_every(pitch * 3 / 2, pitch));
+            for (x, y) in [(long.clone(), short.clone()), (short, long)] {
+                let got = comb_estimate(x, y).unwrap();
+                assert!((got / pitch as f64 - 1.0).abs() < 0.03, "pitch {pitch}: estimated {got:.3}");
+            }
+        }
+        // End to end, on an image.
+        let (img, _) = synthetic_lattice(&[12; 10], &[9, 9], &DISTINCT_8, false, 0, 5);
+        for image in [img.clone(), image::imageops::rotate90(&img)] {
+            let grid = dp_grid(&image);
+            let (long, short) = if image.width() > image.height() { (&grid.cols, &grid.rows) } else { (&grid.rows, &grid.cols) };
+            assert_eq!(long.len() - 1, 10, "{long:?}");
+            assert!(short.len() - 1 <= 2, "{short:?}");
+        }
+    }
+
+    #[test]
+    fn comb_reports_no_lattice_where_there_is_none() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        // Nothing at all.
+        assert_eq!(comb_estimate(vec![0.0; 300], vec![0.0; 300]), None);
+        // Noise.
+        let noise = |rng: &mut ChaCha8Rng, n: usize| (0..n).map(|_| rng.gen_range(0.0..1.0)).collect::<Vec<f64>>();
+        assert_eq!(comb_estimate(noise(&mut rng, 600), noise(&mut rng, 600)), None);
+        // One edge per axis: every comb can be laid through it, and that proves nothing.
+        let mut one = vec![0.0; 400];
+        one[137] = 10.0;
+        assert_eq!(comb_estimate(one.clone(), one), None);
+    }
+
+    /// A known limit, pinned so that it is a decision and not a surprise. A few dozen
+    /// strong edges at unrelated positions on an otherwise empty profile are, to a
+    /// comb, a fine lattice with most of its edges missing: teeth 3 or 4 px apart can
+    /// reach any set of positions. Photographs and illustrations do not produce such
+    /// profiles (theirs are dense, and score like noise); a diagram or a screenshot
+    /// could. The lattice score computed afterwards is what flags those.
+    #[test]
+    fn sparse_unrelated_edges_read_as_a_fine_lattice() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let mut scattered = || {
+            let mut p = vec![0.0; 600];
+            for _ in 0..70 {
+                p[rng.gen_range(1..599)] += 8.0;
+            }
+            p
+        };
+        let pitch = comb_estimate(scattered(), scattered()).expect("read as a lattice");
+        assert!(pitch < 4.5, "{pitch}");
+    }
+
+    #[test]
+    fn comb_capture_collects_what_its_teeth_can_reach() {
+        // Edges 5 apart, then one that is 7 from the last.
+        let mut g = vec![0.0; 40];
+        for c in [5, 10, 15, 20, 27] {
+            g[c] = 1.0;
+        }
+        // Teeth 5 or 6 apart reach the first four; from 20 the next tooth is at 25 or
+        // 26 and the edge at 27 is missed.
+        let on_edges = |c: &Comb| c.teeth.iter().filter(|&&t| g[t] > 0.0).count();
+        let comb = comb_capture(&g, 5, 6);
+        assert_eq!((comb.gain, on_edges(&comb)), (4.0, 4));
+        assert!(comb.teeth.windows(2).all(|p| (5..=6).contains(&(p[1] - p[0]))), "{:?}", comb.teeth);
+        // Teeth 5 to 7 apart reach all five.
+        let comb = comb_capture(&g, 5, 7);
+        assert_eq!((comb.gain, on_edges(&comb)), (5.0, 5));
+        // Teeth 10 or 11 apart get every other one.
+        assert_eq!(comb_capture(&g, 10, 11).gain, 2.0);
+        // Too short an axis for the comb.
+        assert!(comb_capture(&g[..11], 5, 6).teeth.is_empty());
+        // A profile of gains is what `gains_from` makes of raw edge strengths.
+        assert!(gains_from(&g).iter().all(|&v| v >= 0.0));
     }
 }
