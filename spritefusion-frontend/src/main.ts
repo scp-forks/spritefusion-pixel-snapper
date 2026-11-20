@@ -2,7 +2,7 @@ import './style.css';
 import { initWasm, processCandidates } from './wasm';
 import {
   bytesToObjectUrl,
-  countUniqueColors,
+  analyzeImage,
   fileToUint8Array,
   getImageDimensions,
   getOutputFilename,
@@ -116,6 +116,9 @@ const controls = createControls(controlsEl, {
   onGridFitterChange: (gridFitter) => {
     state.settings.gridFitter = gridFitter;
   },
+  onAlphaThresholdChange: (threshold) => {
+    state.settings.alphaThreshold = threshold;
+  },
 });
 
 const comparison = createComparison(comparisonEl);
@@ -147,13 +150,7 @@ function renderOverlay() {
   const drawable = state.showLostDetail && result && result.cols > 0;
   comparison.setOverlay(
     drawable
-      ? {
-          width: result.width,
-          height: result.height,
-          colCuts: result.colCuts,
-          rowCuts: result.rowCuts,
-          values: result.lostDetail,
-        }
+      ? { colCuts: result.colCuts, rowCuts: result.rowCuts, values: result.lostDetail }
       : null,
   );
 }
@@ -189,11 +186,14 @@ async function handleFile(file: File) {
   state.originalWidth = origDim.width;
   state.originalHeight = origDim.height;
 
-  // Count unique colors in background (non-blocking)
+  // Count unique colors in background (non-blocking), and offer the alpha cutoff
+  // only when there is partial alpha for it to decide.
   state.originalUniqueColors = 0;
-  countUniqueColors(state.originalUrl).then((count) => {
+  controls.setAlphaVisible(false);
+  analyzeImage(state.originalUrl).then((info) => {
     if (token !== fileSeq) return;
-    state.originalUniqueColors = count;
+    state.originalUniqueColors = info.uniqueColors;
+    controls.setAlphaVisible(info.partialAlphaPixels > 0);
     if (state.current) renderStats();
   });
 
@@ -242,10 +242,9 @@ function showResult(set: ResultSet, index: number) {
   const result = set.results[index];
   if (comparisonEl.classList.contains('hidden')) {
     comparisonEl.classList.remove('hidden');
-    comparison.setImages(state.originalUrl!, result.url);
-  } else {
-    comparison.updateProcessed(result.url);
+    comparison.setOriginal(state.originalUrl!);
   }
+  comparison.setProcessed(result).catch((err) => showToast(`Display failed: ${err}`));
 
   if (sameSet) {
     candidates.select(index);

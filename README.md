@@ -40,6 +40,8 @@ Pixel Snapper analyzes the input image to detect the underlying pixel grid, then
 2. **Grid detection** — Gradient profiles are computed along both axes to find repeating grid boundaries. An adaptive walker algorithm locates the exact cut positions.
 3. **Resampling** — Each detected grid cell is collapsed into a single output pixel via majority voting, producing a clean image at the **native pixel art resolution**.
 
+Before any of this, transparency is made binary: pixels at least half opaque (alpha ≥ 128, adjustable) become fully opaque and the rest fully transparent. Sprites with soft or fringed edges therefore come out with clean edges and no partial alpha.
+
 ### Output resolution
 
 The output image will be **smaller than the input**. This is by design. For example, a 1024×1024 image with an underlying ~5px grid will produce roughly a 200×200 output — the true pixel art resolution with one pixel per grid cell. To display it at the original size, scale it up with nearest-neighbor interpolation (`image-rendering: pixelated` in CSS).
@@ -67,6 +69,8 @@ npm run dev
 ```
 
 Then open the URL shown in your terminal. Drag and drop an image, adjust the color count, and compare before/after with the interactive slider.
+
+The comparison view never lets the browser resample an image: both sides are drawn at a whole number of screen pixels per image pixel (the zoom buttons step through them; *Fit* picks the largest that fits), and images too large to fit at one screen pixel per pixel scroll instead of shrinking. A snapped result is drawn over the exact source cells it was computed from, so the two sides line up pixel for pixel. Transparent areas show as a checkerboard. Images with semi-transparent pixels get an *Alpha cutoff* slider.
 
 ### 💻 CLI
 
@@ -101,6 +105,7 @@ Optional flags after the color count:
 | `--target-width=<cells>` | Ask for a grid about this many cells wide, instead of `--grid-scale`. On an image with a pixel grid the result follows the grid and may land a few cells off; on one without, the width is exact |
 | `--candidates` | Write several sizes instead of one: the detected grid and finer ones (and `--target-width` if given), as `output.<cols>x<rows>.png`, with one JSON line each. No measurable property of an image picks the right size, so the tool offers a ladder and you choose. Works for the snapped output and for `--cleanup=blocks` |
 | `--lost-detail` | With `--candidates`: also write `output.<cols>x<rows>.lost-detail.png`, one gray pixel per grid cell, white where that size is losing detail a finer size would keep |
+| `--alpha-threshold=<0-255>` | Transparency. Output never has partial alpha: like a GIF, a pixel is either there or not. Source pixels at least this opaque (default `128`) are kept as fully opaque, the rest become fully transparent, before anything else runs, so soft or fringed edges from background removal do not turn into a ring of stray colours. Snap mode and `--cleanup=blocks` then decide transparency per grid cell, like colour. `0` passes partial alpha through as older versions did |
 | `--stats` | Print one JSON line describing the output: size, grid, color count, and how many same-color regions are under 4 px and under 16 px |
 
 ```bash
@@ -142,6 +147,7 @@ opts.cleanup_strength = 1; // for smooth: 1 light, 2 medium, 3 strong
 opts.grid_scale = 2;    // 1 to 16
 opts.grid_fitter = 0;   // 0 original walker, 1 elastic fit (experimental)
 opts.vote = 0;          // 0 majority, 1 detail (keeps thin features, noisier)
+opts.alpha_threshold = 128; // 1-255: at least this opaque = opaque, else transparent; 0 keeps partial alpha
 try {
   const outputPng = process_image_with(inputBytes, opts);
 } finally {

@@ -24,6 +24,11 @@ export interface ProcessSettings {
    * differ from their surroundings count for more). Only used where sizes are offered.
    */
   vote: number;
+  /**
+   * Alpha (1-255) at or above which a source pixel is opaque; fainter ones become
+   * fully transparent. Results never have partial alpha. Used in every mode.
+   */
+  alphaThreshold: number;
 }
 
 export const CLEANUP_OFF = 0;
@@ -47,6 +52,7 @@ export const DEFAULT_SETTINGS: ProcessSettings = {
   gridFitter: FITTER_WALK,
   targetWidth: 0,
   vote: VOTE_MAJORITY,
+  alphaThreshold: 128,
 };
 
 /** Modes that produce several sizes to choose from. */
@@ -82,8 +88,8 @@ export function effectiveSettings(s: ProcessSettings): ProcessSettings {
 export function settingsKey(s: ProcessSettings): string {
   const e = effectiveSettings(s);
   return e.noResize
-    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridFitter}:${e.targetWidth}:${e.vote}`
-    : `snap:${e.kColors}:${e.gridFitter}:${e.targetWidth}:${e.vote}`;
+    ? `noresize:${e.kColors}:${e.algorithm}:${e.cleanup}:${e.cleanupStrength}:${e.gridFitter}:${e.targetWidth}:${e.vote}:${e.alphaThreshold}`
+    : `snap:${e.kColors}:${e.gridFitter}:${e.targetWidth}:${e.vote}:${e.alphaThreshold}`;
 }
 
 /** Lattice score at or above which the image clearly has a pixel grid. */

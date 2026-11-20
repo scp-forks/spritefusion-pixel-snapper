@@ -107,6 +107,47 @@ fn validate_grid_scale(scale: f64) -> std::result::Result<f64, String> {
     }
 }
 
+/// Default for `Config::alpha_threshold`: a pixel at least half opaque is opaque.
+pub const DEFAULT_ALPHA_THRESHOLD: u8 = 128;
+
+/// Make every pixel fully opaque or fully transparent, before anything else looks at
+/// the image.
+///
+/// The output of every mode is a palette image, and partial alpha has no place in one:
+/// a soft edge would come out as a ring of half-transparent palette colours, and in the
+/// snap vote each alpha level would count as a colour of its own. So, as in a GIF, a
+/// pixel is either there or not. Pixels with `alpha >= threshold` become opaque and keep
+/// their colour; the rest become `[0, 0, 0, 0]`, so that the colour hidden under
+/// transparency (which background-removal tools leave behind at random) can neither
+/// split a vote nor reach the output. Grid fitting, palette reduction and cleanup then
+/// all see the same silhouette.
+///
+/// `threshold == 0` leaves the image untouched (partial alpha passes through, as it did
+/// before this step existed). A fully opaque image is unchanged by any threshold.
+pub fn binarize_alpha(img: &mut RgbaImage, threshold: u8) {
+    if threshold == 0 {
+        return;
+    }
+    for p in img.pixels_mut() {
+        if p[3] >= threshold {
+            p[3] = 255;
+        } else {
+            *p = Rgba([0, 0, 0, 0]);
+        }
+    }
+}
+
+/// Decode an input image and prepare it for every pipeline: size checks, then
+/// [`binarize_alpha`].
+fn decode_input(input_bytes: &[u8], config: &Config) -> Result<RgbaImage> {
+    let img = image::load_from_memory(input_bytes)?;
+    let (width, height) = img.dimensions();
+    validate_image_dimensions(width, height)?;
+    let mut rgba_img = img.to_rgba8();
+    binarize_alpha(&mut rgba_img, config.alpha_threshold);
+    Ok(rgba_img)
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Config {
@@ -142,6 +183,9 @@ pub struct Config {
     grid_fitter: grid::GridFitter,
     /// A grid about this many cells wide, instead of `grid_scale`. 0 = not set.
     target_width: u32,
+    /// Alpha at or above which a source pixel counts as opaque; see [`binarize_alpha`].
+    /// 0 keeps partial alpha as it is.
+    alpha_threshold: u8,
     /// CLI only: write every candidate of the audition instead of one result.
     #[allow(dead_code)]
     write_candidates: bool,
@@ -177,6 +221,7 @@ impl Default for Config {
             grid_scale: 1.0,
             grid_fitter: grid::GridFitter::Walk,
             target_width: 0,
+            alpha_threshold: DEFAULT_ALPHA_THRESHOLD,
             write_candidates: false,
             write_lost_detail: false,
             print_stats: false,
@@ -386,12 +431,8 @@ struct CandidateRecord {
 /// Decode, build every candidate (see [`candidates::build`]), encode each as PNG.
 #[allow(dead_code)] // WASM, the CLI's --candidates and tests
 fn process_candidates_bytes(input_bytes: &[u8], config: &Config) -> Result<Vec<CandidateRecord>> {
-    let img = image::load_from_memory(input_bytes)?;
-    let (width, height) = img.dimensions();
-    validate_image_dimensions(width, height)?;
     validate_grid_scale(config.grid_scale).map_err(PixelSnapperError::InvalidInput)?;
-
-    let rgba_img = img.to_rgba8();
+    let rgba_img = decode_input(input_bytes, config)?;
     candidates::build(&rgba_img, config)?
         .into_iter()
         .map(|c| {
@@ -423,12 +464,7 @@ fn process_image_bytes_detailed(
     input_bytes: &[u8],
     config: &Config,
 ) -> Result<(Vec<u8>, Option<GridReport>)> {
-    let img = image::load_from_memory(input_bytes)?;
-    let (width, height) = img.dimensions();
-
-    validate_image_dimensions(width, height)?;
-
-    let rgba_img = img.to_rgba8();
+    let rgba_img = decode_input(input_bytes, config)?;
     let output = run_pipeline(&rgba_img, config)?;
 
     let output_bytes = encode_png(&output.image)?;
@@ -474,6 +510,7 @@ fn config_from_options(
     grid_fitter: f64,
     target_width: f64,
     vote: f64,
+    alpha_threshold: f64,
 ) -> std::result::Result<Config, String> {
     let k_colors = checked_u32("k_colors", k_colors)?;
     let algorithm = checked_u32("algorithm", algorithm)?;
@@ -482,6 +519,10 @@ fn config_from_options(
     let grid_fitter = checked_u32("grid_fitter", grid_fitter)?;
     let target_width = checked_u32("target_width", target_width)?;
     let vote = checked_u32("vote", vote)?;
+    let alpha_threshold = checked_u32("alpha_threshold", alpha_threshold)?;
+    let alpha_threshold = u8::try_from(alpha_threshold).map_err(|_| {
+        format!("alpha_threshold must be between 0 (keep partial alpha) and 255, got {}", alpha_threshold)
+    })?;
     if target_width > MAX_TARGET_WIDTH {
         return Err(format!(
             "target_width must be between 0 (not set) and {}, got {}",
@@ -508,6 +549,7 @@ fn config_from_options(
         grid_fitter: grid::GridFitter::try_from_u32(grid_fitter)?,
         target_width,
         vote: cleanup::Vote::try_from_u32(vote)?,
+        alpha_threshold,
         ..Default::default()
     })
 }
@@ -545,6 +587,10 @@ pub struct ProcessOptions {
     /// that differ from their surroundings count for more: keeps thin lines and small
     /// features, and turns texture into noise). Snap mode and cleanup 1. Default 0.
     pub vote: f64,
+    /// Alpha (1-255) at or above which a pixel is opaque; every other pixel becomes
+    /// fully transparent, so the output has no partial alpha. 0 keeps partial alpha as
+    /// it is. Default 128.
+    pub alpha_threshold: f64,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -562,6 +608,7 @@ impl ProcessOptions {
             grid_fitter: 0.0,
             target_width: 0.0,
             vote: 0.0,
+            alpha_threshold: DEFAULT_ALPHA_THRESHOLD as f64,
         }
     }
 }
@@ -584,6 +631,7 @@ pub fn process_image_with(
         opts.grid_fitter,
         opts.target_width,
         opts.vote,
+        opts.alpha_threshold,
     )
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
 
@@ -643,6 +691,7 @@ pub fn process_candidates(
         opts.grid_fitter,
         opts.target_width,
         opts.vote,
+        opts.alpha_threshold,
     )
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e))?;
 
@@ -745,7 +794,7 @@ fn parse_args() -> Option<Config> {
     // Optional flags: --no-resize, --algorithm=<0-5>, --cleanup=off|blocks|smooth,
     //                 --strength=light|medium|strong, --grid-scale=<1..16>,
     //                 --grid-fitter=walk|dp, --target-width=<cells>, --vote=majority|detail,
-    //                 --candidates, --lost-detail, --stats
+    //                 --alpha-threshold=<0..255>, --candidates, --lost-detail, --stats
     // Algorithm IDs: 0=K-Means Perceptual, 1=Median Cut, 2=Wu's Optimal,
     //                3=Spatial, 4=Grey Wolf, 5=Differentiable Palette
     for arg in args.iter().skip(3) {
@@ -757,6 +806,14 @@ fn parse_args() -> Option<Config> {
             config.write_candidates = true;
         } else if arg == "--lost-detail" {
             config.write_lost_detail = true;
+        } else if let Some(t_str) = arg.strip_prefix("--alpha-threshold=") {
+            match t_str.parse::<u8>() {
+                Ok(t) => config.alpha_threshold = t,
+                Err(_) => eprintln!(
+                    "Warning: invalid alpha threshold '{}' (0 to 255), using {}",
+                    t_str, config.alpha_threshold
+                ),
+            }
         } else if let Some(width_str) = arg.strip_prefix("--target-width=") {
             match width_str.parse::<u32>() {
                 Ok(w) if (1..=MAX_TARGET_WIDTH).contains(&w) => config.target_width = w,
@@ -3606,10 +3663,14 @@ mod tests {
     /// byte-identical while the cleanup and audition features are built around it.
     /// If one of these fails, the shipping output changed. Do not update the numbers
     /// unless that was the explicit purpose of the change.
+    ///
+    /// Alpha binarization (`Config::alpha_threshold`) came later and changes the output
+    /// of images with partial alpha; with it switched off the old output is exact.
     #[test]
     fn golden_snap_outputs_unchanged() {
+        let legacy = Config { alpha_threshold: 0, ..Default::default() };
         for (name, bytes, golden) in golden_fixtures() {
-            let png = process_image_bytes_common(bytes, None).unwrap();
+            let png = process_image_bytes_common(bytes, Some(legacy.clone())).unwrap();
             let out = decode(&png);
             assert_eq!(
                 (out.dimensions(), image_hash(&out)),
@@ -3879,61 +3940,138 @@ mod tests {
 
     #[test]
     fn options_are_validated_not_clamped() {
-        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0, 2.0, 0.0, 0.0, 0.0).unwrap();
+        let ok = config_from_options(8.0, true, 3.0, 1.0, 2.0, 2.0, 0.0, 0.0, 0.0, 128.0).unwrap();
         assert_eq!(ok.k_colors, 8);
         assert!(ok.no_resize);
         assert_eq!(ok.algorithm, QuantAlgorithm::SpatialQuantization);
         assert_eq!(ok.cleanup, Cleanup::Blocks);
         assert_eq!(ok.cleanup_strength, cleanup::Strength::Medium);
         assert_eq!(ok.grid_scale, 2.0);
-        assert_eq!(config_from_options(8.0, true, 0.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0).unwrap().cleanup, Cleanup::Smooth);
+        assert_eq!(config_from_options(8.0, true, 0.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 128.0).unwrap().cleanup, Cleanup::Smooth);
 
-        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "zero colours");
-        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "unknown algorithm");
-        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "unknown cleanup");
-        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "cleanup without no_resize");
-        assert!(config_from_options(16.0, false, 0.0, 2.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "smooth without no_resize");
+        assert!(config_from_options(0.0, true, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "zero colours");
+        assert!(config_from_options(16.0, true, 6.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "unknown algorithm");
+        assert!(config_from_options(16.0, true, 0.0, 9.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "unknown cleanup");
+        assert!(config_from_options(16.0, false, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "cleanup without no_resize");
+        assert!(config_from_options(16.0, false, 0.0, 2.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "smooth without no_resize");
         assert_eq!(
-            config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0).unwrap().grid_fitter,
+            config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 128.0).unwrap().grid_fitter,
             grid::GridFitter::Dp
         );
-        assert_eq!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 128.0, 0.0).unwrap().target_width, 128);
+        assert_eq!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 128.0, 0.0, 128.0).unwrap().target_width, 128);
         for width in [-1.0, 0.5, 5001.0, f64::NAN] {
-            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, width, 0.0).is_err(), "target width {width}");
+            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, width, 0.0, 128.0).is_err(), "target width {width}");
         }
         assert_eq!(
-            config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0).unwrap().vote,
+            config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 128.0).unwrap().vote,
             cleanup::Vote::Detail
         );
         for vote in [2.0, -1.0, 0.5, f64::NAN] {
-            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, vote).is_err(), "vote {vote}");
+            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, vote, 128.0).is_err(), "vote {vote}");
         }
         for fitter in [2.0, -1.0, 0.5, f64::NAN] {
-            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, fitter, 0.0, 0.0).is_err(), "fitter {fitter}");
+            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, fitter, 0.0, 0.0, 128.0).is_err(), "fitter {fitter}");
         }
         for strength in [0.0, 4.0, 1.5, f64::NAN] {
-            assert!(config_from_options(16.0, true, 0.0, 2.0, strength, 1.0, 0.0, 0.0, 0.0).is_err(), "strength {strength}");
+            assert!(config_from_options(16.0, true, 0.0, 2.0, strength, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "strength {strength}");
         }
         for scale in [0.0, 0.99, 16.5, -2.0, f64::NAN, f64::INFINITY] {
-            assert!(config_from_options(16.0, true, 0.0, 0.0, 1.0, scale, 0.0, 0.0, 0.0).is_err(), "grid scale {scale}");
+            assert!(config_from_options(16.0, true, 0.0, 0.0, 1.0, scale, 0.0, 0.0, 0.0, 128.0).is_err(), "grid scale {scale}");
         }
         // What `>>> 0` would have turned into something valid.
         for bad in [f64::NAN, f64::INFINITY, -1.0, 1.5, 4294967296.0, 4294967312.0] {
-            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "k_colors {bad}");
-            assert!(config_from_options(16.0, true, bad, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "algorithm {bad}");
-            assert!(config_from_options(16.0, true, 0.0, bad, 1.0, 1.0, 0.0, 0.0, 0.0).is_err(), "cleanup {bad}");
+            assert!(config_from_options(bad, true, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "k_colors {bad}");
+            assert!(config_from_options(16.0, true, bad, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "algorithm {bad}");
+            assert!(config_from_options(16.0, true, 0.0, bad, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).is_err(), "cleanup {bad}");
+        }
+        assert_eq!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0).unwrap().alpha_threshold, 0);
+        assert_eq!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 255.0).unwrap().alpha_threshold, 255);
+        for t in [256.0, -1.0, 127.5, f64::NAN] {
+            assert!(config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, t).is_err(), "alpha threshold {t}");
         }
         assert_eq!(checked_u32("x", 4294967295.0), Ok(u32::MAX));
         assert_eq!(checked_u32("x", 0.0), Ok(0));
     }
 
-    /// `process_image_with` with default options must be the legacy snap output.
+    /// `process_image_with` with default options must be what `process_image` returns.
     #[test]
     fn default_options_reproduce_the_legacy_output() {
-        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0).unwrap();
-        for (name, bytes, golden) in golden_fixtures() {
+        let config = config_from_options(16.0, false, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 128.0).unwrap();
+        for (name, bytes, _) in golden_fixtures() {
             let png = process_image_bytes_common(bytes, Some(config.clone())).unwrap();
-            assert_eq!(fnv1a(&png), golden.png, "fixture {name}");
+            let legacy = process_image_bytes_common(bytes, None).unwrap();
+            assert_eq!(fnv1a(&png), fnv1a(&legacy), "fixture {name}");
+        }
+    }
+
+    #[test]
+    fn binarize_alpha_thresholds_and_clears_hidden_colour() {
+        let px = [[10, 20, 30, 0], [10, 20, 30, 127], [10, 20, 30, 128], [10, 20, 30, 254], [1, 2, 3, 255]];
+        let mut img = make_test_image(5, 1, &px);
+        binarize_alpha(&mut img, 128);
+        let got: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
+        assert_eq!(got, vec![[0, 0, 0, 0], [0, 0, 0, 0], [10, 20, 30, 255], [10, 20, 30, 255], [1, 2, 3, 255]]);
+
+        let mut off = make_test_image(5, 1, &px);
+        binarize_alpha(&mut off, 0);
+        assert_eq!(off, make_test_image(5, 1, &px), "threshold 0 leaves the image alone");
+
+        let mut low = make_test_image(5, 1, &px);
+        binarize_alpha(&mut low, 1);
+        assert_eq!(low.get_pixel(1, 0).0, [10, 20, 30, 255], "threshold 1: any coverage is opaque");
+        assert_eq!(low.get_pixel(0, 0).0, [0, 0, 0, 0]);
+    }
+
+    /// Every mode's output has binary alpha by default, on a sprite with a soft edge
+    /// and colour hidden under its transparent pixels.
+    #[test]
+    fn every_mode_outputs_binary_alpha() {
+        let bytes = include_bytes!("../tests/fixtures/wolf_ear_128_alpha.png");
+        let modes: [(bool, u32, Cleanup); 4] = [
+            (false, 0, Cleanup::Off),
+            (true, 0, Cleanup::Off),
+            (true, 0, Cleanup::Blocks),
+            (true, 0, Cleanup::Smooth),
+        ];
+        for (no_resize, alg, cleanup) in modes {
+            for alg in [alg, 2, 3] {
+                let config = Config {
+                    no_resize,
+                    algorithm: QuantAlgorithm::try_from_u32(alg).unwrap(),
+                    cleanup,
+                    ..Default::default()
+                };
+                let out = decode(&process_image_bytes_common(bytes, Some(config)).unwrap());
+                for p in out.pixels() {
+                    assert!(
+                        p[3] == 255 || p.0 == [0, 0, 0, 0],
+                        "no_resize {no_resize}, algorithm {alg}, {cleanup:?}: pixel {p:?}"
+                    );
+                }
+            }
+        }
+        for c in process_candidates_bytes(bytes, &Config::default()).unwrap() {
+            assert!(decode(&c.png).pixels().all(|p| p[3] == 255 || p.0 == [0, 0, 0, 0]));
+        }
+    }
+
+    /// The default snap output, with alpha binarized: unchanged on opaque images, and
+    /// on the sprite with soft edges every pixel is fully opaque or `[0, 0, 0, 0]`.
+    #[test]
+    fn default_snap_output_has_binary_alpha() {
+        for (name, bytes, golden) in golden_fixtures() {
+            let out = decode(&process_image_bytes_common(bytes, None).unwrap());
+            for p in out.pixels() {
+                assert!(p[3] == 255 || p.0 == [0, 0, 0, 0], "fixture {name}: pixel {p:?}");
+            }
+            let expected = if name == "wolf_ear_128_alpha" {
+                // Recorded when binarization was introduced. The grid moved from 28x27:
+                // the sprite's edge is now one crisp step instead of a soft ramp.
+                ((27, 28), 2999512932145660201u64)
+            } else {
+                (golden.dims, golden.pixels)
+            };
+            assert_eq!((out.dimensions(), image_hash(&out)), expected, "fixture {name}");
         }
     }
 

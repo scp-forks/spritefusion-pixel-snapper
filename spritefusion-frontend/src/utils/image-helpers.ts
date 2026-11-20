@@ -27,7 +27,14 @@ export function getImageDimensions(
   });
 }
 
-export function countUniqueColors(url: string): Promise<number> {
+export interface ImageAnalysis {
+  /** Distinct RGB colours over every pixel. */
+  uniqueColors: number;
+  /** Pixels neither fully opaque nor fully transparent. */
+  partialAlphaPixels: number;
+}
+
+export function analyzeImage(url: string): Promise<ImageAnalysis> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -38,10 +45,13 @@ export function countUniqueColors(url: string): Promise<number> {
       ctx.drawImage(img, 0, 0);
       const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
       const colors = new Set<number>();
+      let partialAlphaPixels = 0;
       for (let i = 0; i < data.length; i += 4) {
         colors.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
+        const a = data[i + 3];
+        if (a !== 0 && a !== 255) partialAlphaPixels++;
       }
-      resolve(colors.size);
+      resolve({ uniqueColors: colors.size, partialAlphaPixels });
     };
     img.onerror = () => reject(new Error('Failed to load image'));
     img.src = url;

@@ -45,6 +45,8 @@ pub struct BlocksPrep<'a> {
     pub profiles: Profiles,
     /// The detected grid, with no cell under 2 px.
     pub base: Grid,
+    /// Decide alpha per cell instead of per pixel; see [`BlocksPrep::render`].
+    cell_alpha: bool,
 }
 
 /// Prepare Blocks for `source`, or `None` when there is nothing to snap (no opaque
@@ -74,7 +76,8 @@ pub fn prepare_blocks<'a>(
     let pal_lab = palette_oklab(&ix.palette);
     unmix(&mut ix, &lab, &pal_lab, unmix_radius(estimated_pitch(Some(&base))));
 
-    Ok(Some(BlocksPrep { unmixed: ix, raw_labels, lab, profiles, base }))
+    let cell_alpha = config.alpha_threshold > 0;
+    Ok(Some(BlocksPrep { unmixed: ix, raw_labels, lab, profiles, base, cell_alpha }))
 }
 
 impl BlocksPrep<'_> {
@@ -84,9 +87,17 @@ impl BlocksPrep<'_> {
     ///   `alpha > 0`, counted after un-mixing; ties go to the label that appears first
     ///   in the image. `Vote::Detail`: see [`vote_cells_detail`], on the labels as
     ///   quantized.
-    /// * Alpha: every pixel keeps its own source alpha. Fully transparent pixels are
-    ///   copied from the source, so an opaque feature inside a mostly transparent cell
-    ///   keeps its shape and takes the cell's colour.
+    /// * Alpha, by default (`Config::alpha_threshold > 0`): per cell, like the colour.
+    ///   A cell is opaque when at least half of its pixels are (the rule the snap
+    ///   output's detail vote uses), and fully transparent, `[0, 0, 0, 0]`, otherwise.
+    ///   The sprite's outline then follows the grid like everything else in it,
+    ///   instead of cutting cells in two along wherever the source's soft edge crossed
+    ///   the threshold. A feature thinner than half a cell inside transparent cells
+    ///   goes with them, as it would in the snapped output; a finer grid keeps it.
+    /// * Alpha with `alpha_threshold == 0` (partial alpha kept): every pixel keeps its
+    ///   own source alpha. Fully transparent pixels are copied from the source, so an
+    ///   opaque feature inside a mostly transparent cell keeps its shape and takes the
+    ///   cell's colour.
     pub fn render(&self, grid: &Grid, vote: Vote) -> RgbaImage {
         let labels = match vote {
             Vote::Majority => self.unmixed.labels.clone(),
@@ -101,9 +112,42 @@ impl BlocksPrep<'_> {
             Vote::Majority => vote_cells(&ix, grid),
             Vote::Detail => vote_cells_detail(&ix, &self.lab, grid),
         };
+        if self.cell_alpha {
+            return paint_cells_opaque(&ix, grid, &winners);
+        }
         paint_cells(&mut ix, grid, &winners);
         render(&ix)
     }
+}
+
+/// Paint each cell whole: its winning colour, fully opaque, when at least half of its
+/// pixels are opaque; `[0, 0, 0, 0]` otherwise.
+fn paint_cells_opaque(ix: &IndexedImage, grid: &Grid, winners: &[u16]) -> RgbaImage {
+    let w = ix.width();
+    let mut out = RgbaImage::new(ix.source.width(), ix.source.height());
+    let cells_per_row = grid.cols.len() - 1;
+    for (cy, row) in grid.rows.windows(2).enumerate() {
+        for (cx, col) in grid.cols.windows(2).enumerate() {
+            let winner = winners[cy * cells_per_row + cx];
+            if winner == TRANSPARENT {
+                continue; // no opaque pixel at all
+            }
+            let area = (row[1] - row[0]) * (col[1] - col[0]);
+            let opaque: usize = (row[0]..row[1])
+                .map(|y| ix.labels[y * w + col[0]..y * w + col[1]].iter().filter(|&&l| l != TRANSPARENT).count())
+                .sum();
+            if opaque * 2 < area {
+                continue;
+            }
+            let [r, g, b] = ix.palette[winner as usize];
+            for y in row[0]..row[1] {
+                for x in col[0]..col[1] {
+                    out.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// **Blocks** ("snap in place"): one colour per grid cell, painted back at the
@@ -938,10 +982,15 @@ mod tests {
         img
     }
 
+    /// Partial alpha kept (`alpha_threshold == 0`): Blocks leaves alpha alone.
+    fn blocks_config_keep_alpha(k: usize) -> Config {
+        Config { alpha_threshold: 0, ..blocks_config(k, 1.0) }
+    }
+
     #[test]
     fn alpha_is_preserved_pixel_for_pixel() {
         let img = sprite_with_alpha();
-        let out = run_pipeline(&img, &blocks_config(8, 1.0)).unwrap().image;
+        let out = run_pipeline(&img, &blocks_config_keep_alpha(8)).unwrap().image;
         assert!(out.pixels().any(|p| p[3] > 0 && p[3] < 255), "test image must have partial alpha");
         for (src, dst) in img.pixels().zip(out.pixels()) {
             assert_eq!(src[3], dst[3], "alpha changed");
@@ -954,7 +1003,7 @@ mod tests {
     #[test]
     fn a_thin_opaque_line_in_transparent_cells_survives() {
         let img = sprite_with_alpha();
-        let out = run_pipeline(&img, &blocks_config(8, 1.0)).unwrap().image;
+        let out = run_pipeline(&img, &blocks_config_keep_alpha(8)).unwrap().image;
         let line_colour = out.get_pixel(4, 61).0;
         assert!(line_colour[0] < 60 && line_colour[3] == 255, "line colour {line_colour:?}");
         for x in 4..24 {
@@ -968,6 +1017,42 @@ mod tests {
                 assert_eq!(out.get_pixel(x, 61).0, line_colour, "line recoloured at x={x}");
             }
         }
+    }
+
+    /// By default every cell is opaque or transparent as a whole, by the half rule.
+    #[test]
+    fn alpha_is_decided_per_cell() {
+        let mut img = sprite_with_alpha();
+        crate::binarize_alpha(&mut img, crate::DEFAULT_ALPHA_THRESHOLD);
+        let config = blocks_config(8, 1.0);
+        let grid = run_pipeline(&img, &config).unwrap().grid.expect("a grid");
+        let out = run_pipeline(&img, &config).unwrap().image;
+        let mut cells = 0;
+        for row in grid.rows.windows(2) {
+            for col in grid.cols.windows(2) {
+                let area = (row[1] - row[0]) * (col[1] - col[0]);
+                let src_opaque = (row[0]..row[1])
+                    .flat_map(|y| (col[0]..col[1]).map(move |x| (x, y)))
+                    .filter(|&(x, y)| img.get_pixel(x as u32, y as u32)[3] > 0)
+                    .count();
+                let first = *out.get_pixel(col[0] as u32, row[0] as u32);
+                for y in row[0]..row[1] {
+                    for x in col[0]..col[1] {
+                        assert_eq!(*out.get_pixel(x as u32, y as u32), first, "cell not uniform");
+                    }
+                }
+                let expect_opaque = src_opaque > 0 && src_opaque * 2 >= area;
+                assert_eq!(first[3] == 255, expect_opaque, "cell at {col:?}x{row:?}: {src_opaque}/{area} opaque");
+                if !expect_opaque {
+                    assert_eq!(first.0, [0, 0, 0, 0]);
+                }
+                cells += 1;
+            }
+        }
+        assert!(cells > 100);
+        // The 1 px line is thinner than half of any cell it crosses, so it goes, as it
+        // would in the snapped output.
+        assert!((4..20).all(|x| out.get_pixel(x, 61)[3] == 0));
     }
 
     #[test]
@@ -1573,16 +1658,21 @@ mod tests {
             assert_eq!(*p, if x == 4 { line } else { field }, "snap detail at ({x},{y})");
         }
 
-        // Alpha: Blocks keeps every pixel's own alpha under either vote.
+        // Alpha with partial alpha kept: Blocks keeps every pixel's own alpha under
+        // either vote.
         let sprite = sprite_with_alpha();
-        let out = run_pipeline(&sprite, &Config { vote: Vote::Detail, ..blocks_config(8, 1.0) }).unwrap().image;
+        let keep = Config { vote: Vote::Detail, ..blocks_config_keep_alpha(8) };
+        let out = run_pipeline(&sprite, &keep).unwrap().image;
         for (src, dst) in sprite.pixels().zip(out.pixels()) {
             assert_eq!(src[3], dst[3]);
             if src[3] == 0 {
                 assert_eq!(src, dst);
             }
         }
-        assert_eq!(out, run_pipeline(&sprite, &Config { vote: Vote::Detail, ..blocks_config(8, 1.0) }).unwrap().image);
+        assert_eq!(out, run_pipeline(&sprite, &keep).unwrap().image);
+        // By default the detail vote, too, decides alpha per cell.
+        let out = run_pipeline(&sprite, &Config { vote: Vote::Detail, ..blocks_config(8, 1.0) }).unwrap().image;
+        assert!(out.pixels().all(|p| p[3] == 255 || p.0 == [0, 0, 0, 0]));
     }
 
     /// The snap output of the detail vote is opaque exactly when at least half of the

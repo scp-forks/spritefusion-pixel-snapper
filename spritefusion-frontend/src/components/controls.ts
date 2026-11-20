@@ -8,6 +8,7 @@ export interface ControlsCallbacks {
   onCleanupChange: (cleanup: number) => void;
   onCleanupStrengthChange: (strength: number) => void;
   onGridFitterChange: (gridFitter: number) => void;
+  onAlphaThresholdChange: (threshold: number) => void;
 }
 
 export function createControls(
@@ -20,6 +21,13 @@ export function createControls(
         Colors: <span class="controls-value">16</span>
       </label>
       <input type="range" class="controls-slider" min="2" max="64" value="16" />
+    </div>
+    <div class="controls-row controls-alpha hidden"
+      title="This image has semi-transparent pixels, and the result will have none: like a GIF, every pixel is either there or not. A pixel at least this opaque (out of 255) is kept, anything fainter becomes fully transparent, before any other processing. Lower keeps more of a soft edge; higher trims it.">
+      <label class="controls-label">
+        Alpha cutoff: <span class="controls-value controls-alpha-value">128</span>
+      </label>
+      <input type="range" class="controls-slider controls-alpha-slider" min="1" max="255" value="128" />
     </div>
     <div class="controls-row-options">
       <label class="controls-checkbox-label">
@@ -59,6 +67,9 @@ export function createControls(
   `;
 
   const slider = container.querySelector<HTMLInputElement>('.controls-slider')!;
+  const alphaRow = container.querySelector<HTMLDivElement>('.controls-alpha')!;
+  const alphaSlider = container.querySelector<HTMLInputElement>('.controls-alpha-slider')!;
+  const alphaValue = container.querySelector<HTMLSpanElement>('.controls-alpha-value')!;
   const valueLabel = container.querySelector<HTMLSpanElement>('.controls-value')!;
   const checkbox = container.querySelector<HTMLInputElement>('.controls-checkbox')!;
   const algorithmSelect = container.querySelector<HTMLSelectElement>('.controls-algorithm')!;
@@ -116,6 +127,18 @@ export function createControls(
     scheduleProcess();
   });
 
+  // Same pattern as the colour slider: readout while dragging, run on commit.
+  alphaSlider.addEventListener('input', () => {
+    const t = parseInt(alphaSlider.value, 10);
+    alphaValue.textContent = String(t);
+    callbacks.onAlphaThresholdChange(t);
+    cancelScheduled();
+  });
+  alphaSlider.addEventListener('change', () => {
+    callbacks.onAlphaThresholdChange(parseInt(alphaSlider.value, 10));
+    scheduleProcess();
+  });
+
   checkbox.addEventListener('change', () => {
     syncVisibility();
     callbacks.onNoResizeChange(checkbox.checked);
@@ -153,6 +176,7 @@ export function createControls(
     setProcessing(processing: boolean) {
       btn.disabled = processing;
       slider.disabled = processing;
+      alphaSlider.disabled = processing;
       checkbox.disabled = processing;
       algorithmSelect.disabled = processing;
       cleanupSelect.disabled = processing;
@@ -160,6 +184,10 @@ export function createControls(
       gridFitterSelect.disabled = processing;
       btnText.textContent = processing ? 'Processing...' : 'Process';
       btnSpinner.classList.toggle('hidden', !processing);
+    },
+    /** Show the alpha cutoff only for images that have semi-transparent pixels. */
+    setAlphaVisible(visible: boolean) {
+      alphaRow.classList.toggle('hidden', !visible);
     },
     getKColors(): number {
       return parseInt(slider.value, 10);

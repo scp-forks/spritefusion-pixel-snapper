@@ -59,6 +59,7 @@ export async function processCandidates(
     opts.grid_fitter = s.gridFitter;
     opts.target_width = s.targetWidth;
     opts.vote = s.vote;
+    opts.alpha_threshold = s.alphaThreshold;
     return process_candidates(bytes, opts).map((c) => {
       // Every getter copies its value out of WASM memory: read each once, then
       // release the object. wasm-bindgen objects are not garbage collected.

@@ -315,65 +315,120 @@ body {
 /* === Comparison === */
 #comparison {
   margin-top: 1.5rem;
-}
-
-.comparison-wrapper {
-  position: relative;
-  max-width: 800px;
-  margin: 0 auto;
-  overflow: hidden;
-  border-radius: var(--radius);
-  background: var(--surface);
-  user-select: none;
-  touch-action: none;
-  transition: max-width 0.3s ease;
+  /* On the full-width parent: the wrapper sizes itself to the image. */
   container-name: comparison-container;
   container-type: inline-size;
 }
 
-.comparison-original,
-.comparison-processed {
-  display: block;
-  width: 100%;
+/* Transparent areas show as a checkerboard, never as the page colour. */
+:root {
+  --checker-a: #2b2b3d;
+  --checker-b: #383850;
+  --checker: repeating-conic-gradient(var(--checker-a) 0 25%, var(--checker-b) 0 50%) 0 0 / 16px 16px;
 }
 
-.comparison-processed {
-  image-rendering: pixelated;
-}
-
-.comparison-clip {
-  position: absolute;
-  top: 0;
-  right: 0;
-  height: 100%;
+.comparison-wrapper {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto;
+  border-radius: var(--radius);
   overflow: hidden;
+  background: var(--surface);
+  user-select: none;
+  touch-action: none;
+  min-width: 120px;
 }
 
-.comparison-processed {
-  position: absolute;
-  top: 0;
-  right: 0;
-  height: 100%;
-  width: 100%;
-  object-fit: cover;
+/* Scrolls when the image at the chosen zoom is larger than the view. */
+.comparison-viewport {
+  overflow: auto;
+  max-width: 100%;
+  width: fit-content;
+  overscroll-behavior: contain;
 }
 
-/* The lost-detail tint: laid out exactly like the processed image it covers. */
+/* The image at its zoomed size; its CSS size is set from the zoom in device pixels. */
+.comparison-stage {
+  position: relative;
+  background: var(--checker);
+}
+
+/* Every layer: the stage's exact size, nearest-neighbour at a whole zoom. */
+.comparison-original,
+.comparison-processed,
 .comparison-overlay {
   position: absolute;
-  top: 0;
-  right: 0;
-  height: 100%;
+  inset: 0;
+  display: block;
   width: 100%;
-  object-fit: cover;
+  height: 100%;
   image-rendering: pixelated;
+}
+
+/* Unrotated, as the engine decodes it: it ignores a JPEG's EXIF orientation. */
+.comparison-original {
+  image-orientation: none;
+}
+
+/* The lost-detail tint, on the same grid as the result it covers. */
+.comparison-overlay {
   pointer-events: none;
+}
+
+.comparison-zoom {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 5px;
+  opacity: 0;
+  transition: opacity 0.2s;
+  cursor: default;
+}
+
+.comparison-zoom-btn {
+  min-width: 1.6rem;
+  padding: 0.15rem 0.4rem;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #fff;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.comparison-zoom-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.comparison-zoom-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.comparison-zoom-value {
+  min-width: 2.2rem;
+  text-align: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
 }
 
 .comparison-divider {
   position: absolute;
   top: 0;
   bottom: 0;
+  left: 50%;
   width: 4px;
   background: var(--accent);
   cursor: ew-resize;
@@ -412,7 +467,7 @@ body {
 /* Show overlays on hover or during active drag */
 .comparison-wrapper:hover .comparison-divider,
 .comparison-wrapper:hover .comparison-label,
-.comparison-wrapper:hover .comparison-size-toggle,
+.comparison-wrapper:hover .comparison-zoom,
 .comparison-divider-active,
 .comparison-divider-active ~ .comparison-label {
   opacity: 1;
@@ -449,30 +504,6 @@ body {
 
 .comparison-label-right {
   right: 10px;
-}
-
-.comparison-size-toggle {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 4;
-  padding: 0.25rem 0.6rem;
-  font-size: 0.7rem;
-  font-weight: 600;
-  font-family: inherit;
-  color: #fff;
-  background: rgba(0, 0, 0, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 4px;
-  cursor: pointer;
-  pointer-events: auto;
-  opacity: 0;
-  transition: opacity 0.2s, background 0.15s, border-color 0.15s;
-}
-
-.comparison-size-toggle:hover {
-  background: rgba(0, 0, 0, 0.75);
-  border-color: var(--accent);
 }
 
 /* === Stats === */
@@ -758,13 +789,35 @@ body {
   outline-offset: 2px;
 }
 
-.candidate-thumb {
+/* A 112 px box; the image inside is sized by script (see candidates.ts). */
+.candidate-thumb-box {
   width: 112px;
   height: 112px;
-  object-fit: contain;
-  image-rendering: pixelated;
-  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
   border-radius: 3px;
+  background: var(--checker);
+}
+
+.candidate-thumb {
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* Shown at a whole zoom: nearest-neighbour is exact. */
+.candidate-thumb[data-scale='whole'] {
+  image-rendering: pixelated;
+}
+
+/* Larger than the box: shrunk, and averaged rather than sampled, so that no pixel
+   silently disappears. Only a preview; the comparison view shows the real pixels. */
+.candidate-thumb[data-scale='shrunk'] {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: auto;
 }
 
 .candidate-size {

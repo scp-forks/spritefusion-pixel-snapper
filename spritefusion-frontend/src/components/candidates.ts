@@ -1,5 +1,6 @@
 import type { ResultSet } from '../utils/result-cache';
 import { CLEAR_LATTICE_SCORE, NO_LATTICE_SCORE } from '../settings';
+import { cssSize, thumbZoom } from '../pixel-view';
 
 export interface CandidatesCallbacks {
   /** The user picked the result at this index of the current set. */
@@ -26,6 +27,45 @@ function latticeText(score: number): { text: string; level: string } {
     text: 'No pixel grid found: these sizes are plain reductions',
     level: 'none',
   };
+}
+
+/** Side of the thumbnail box, in CSS pixels; matches `.candidate-thumb-box`. */
+const THUMB_BOX = 112;
+
+/**
+ * A thumbnail that is never resampled by a fractional factor: shown at a whole number
+ * of device pixels per pixel when it fits the box at one or more, otherwise shrunk with
+ * smoothing (averaged, so thin features fade rather than vanish at random). The
+ * comparison view is where the exact pixels are shown.
+ */
+function thumbnail(url: string, width: number, height: number): HTMLImageElement {
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = '';
+  img.className = 'candidate-thumb';
+  img.draggable = false;
+  img.dataset.width = String(width);
+  img.dataset.height = String(height);
+  sizeThumbnail(img);
+  return img;
+}
+
+/** (Re)size a thumbnail for the current device pixel ratio. */
+function sizeThumbnail(img: HTMLImageElement) {
+  const width = Number(img.dataset.width);
+  const height = Number(img.dataset.height);
+  const dpr = window.devicePixelRatio || 1;
+  const zoom = thumbZoom(width, height, THUMB_BOX, dpr);
+  if (zoom === null) {
+    img.dataset.scale = 'shrunk';
+    img.style.width = '';
+    img.style.height = '';
+  } else {
+    const size = cssSize(width, height, zoom, dpr);
+    img.dataset.scale = 'whole';
+    img.style.width = `${size.width}px`;
+    img.style.height = `${size.height}px`;
+  }
 }
 
 function sizeNote(gridScale: number, isLegacy: boolean, typed: boolean): string {
@@ -98,6 +138,11 @@ export function createCandidates(
   });
   input.addEventListener('input', () => input.setCustomValidity(''));
 
+  // Browser zoom and moving to another screen change the device pixel ratio.
+  window.addEventListener('resize', () => {
+    strip.querySelectorAll<HTMLImageElement>('.candidate-thumb').forEach(sizeThumbnail);
+  });
+
   strip.addEventListener('click', (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.candidate');
     if (btn) callbacks.onSelect(Number(btn.dataset.index));
@@ -143,10 +188,9 @@ export function createCandidates(
           btn.setAttribute('aria-selected', String(i === selected));
           if (i === selected) btn.classList.add('selected');
 
-          const img = document.createElement('img');
-          img.src = r.url;
-          img.alt = '';
-          img.className = 'candidate-thumb';
+          const box = document.createElement('span');
+          box.className = 'candidate-thumb-box';
+          box.append(thumbnail(r.url, r.width, r.height));
 
           const size = document.createElement('span');
           size.className = 'candidate-size';
@@ -156,7 +200,7 @@ export function createCandidates(
           note.className = 'candidate-note';
           note.textContent = sizeNote(r.gridScale, r.isLegacy, i === typedIndex);
 
-          btn.append(img, size, note);
+          btn.append(box, size, note);
           return btn;
         }),
       );
